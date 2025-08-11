@@ -119,6 +119,6 @@ for thresh in detThreshs:
 
     stats_df = plot_detection_vs_range(h5_path=h5_path,
                     RLdata=RLdata,
-                    threshold_db=5,
+                    threshold_db=thresh,
                     bin_width_km= .1)
 
