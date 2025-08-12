@@ -122,4 +122,41 @@ for thresh in detThreshs:
                     RLdata=RLdata,
                     threshold_db=thresh,
                     bin_width_km= .1)
+    
+#%% Restrict to sperm whale depths
+
+
+    my_data = genfromtxt('PeakToPeakDive_dive_24_dec.csv', delimiter=',')
+
+# Get the depth values from the HDF5
+import h5py
+
+# Now get the depths
+hf = h5py.File(h5_path, 'r')
+diveId ='dive_42'
+dive_grp = hf[f'drift_01/{diveId}/frequency_35000']
+run_ids = list(dive_grp['arrivals'].keys())
+depth_grid = np.array(dive_grp['depth'])
+
+# Say 500m to 1200m depth that's column 5 on
+np.nanmax(corrected_data)
+corrected_data[:, 1:4] = -500
+corrected_data[:, 13:27] = -500
+
+
+# Plot the new iso-surface
+plot_peak2peak_isosurfaces(
+                h5_path, corrected_data, diveId ='dive_42',
+                iso_levels=(80,),
+                xy_res=200,
+                seabed_color='0.6',
+                elev=25, azim=-90)
+
+
+
+
+
+
+
+
 
