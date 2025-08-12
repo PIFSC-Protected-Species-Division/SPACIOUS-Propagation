@@ -8,7 +8,7 @@ Created on Fri Aug  8 23:22:25 2025
 import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib import cm
-from pyproj import Transformer
+from pyproj import Transformer, Geod
 from mpl_toolkits.mplot3d.art3d import Poly3DCollection
 from scipy.interpolate import griddata, NearestNDInterpolator
 from skimage import measure
@@ -19,7 +19,7 @@ import h5py
 from concurrent.futures import ProcessPoolExecutor
 from tqdm import tqdm
 import os, multiprocessing as mp
-from pyproj import Geod
+
     
 # Create a Geod instance for vectorized geodesic computations.
 geod = Geod(ellps='WGS84')

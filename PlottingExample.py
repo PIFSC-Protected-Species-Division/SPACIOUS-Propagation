@@ -19,9 +19,9 @@ import matplotlib.pyplot as plt
 #%% Creat the CSV's of the arrival RLs
 # File locations for the HDF5 from the bellhop models, audio file to convolve
 # and where to save th exported csvs
-h5_path = 'C:\\Users\\pam_user\\Documents\\GitHub\\SPACIOUS-Propagation-Modes\\Spacious_CalCurses_Sensitivity_PCHIP_35khz_20km.h5'
+h5_path = 'X:\Kaitlin_Palmer\CalCurCEAS_propagation_hdf5s\Spacious_CalCurses_Sensitivity_PCHIP_35khz_20km_800m.h5'
 wav_path = "C:\\Users\\pam_user\\Documents\\GitHub\\SPACIOUS-Propagation-Modes\\ExampleData\\LF_1705_20171028_010934_441.wav"
-out_path = "C:\\Users\\pam_user\\Documents\\GitHub\\SPACIOUS-Propagation-Modes"
+out_path = "X:\Kaitlin_Palmer\CalCurCEAS_propagation_csvs"
 
 
 # --- Signal Setup ---
