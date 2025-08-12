@@ -56,7 +56,7 @@ CreateOutputCSVs(h5_path, segment, samplerate, out_path, nWorkers=56)
 
 
 #%% Load the RL grid in the previous section and make plots 
-RLdata = np.genfromtxt('X:\\Kaitlin_Palmer\\CalCurCEAS_propagation_csvs\\PeakToPeak_dive_42_GliderDepth_800m.csv', delimiter=',')
+RLdata = np.genfromtxt('X:\\Kaitlin_Palmer\\CalCurCEAS_propagation_csvs\\PeakToPeak_dive_42_GliderDepth_500m.csv', delimiter=',')
 np.nanmax(RLdata)
 
 # The impulse response was created using a bellhop model at 35khz and the
@@ -93,14 +93,14 @@ plot_detection_probability(h5_path,
     title=None, s=40)
 
 stats_df = plot_detection_vs_range(h5_path=h5_path,
-                RLdata=RLdata,
-                threshold_db=5,
+                RLdata=corrected_data,
+                threshold_db=80,
                 bin_width_km= .1)
 
 stats_dict = plot_detection_by_bearing( 
                 h5_path= h5_path,
-                RLdata = RLdata,
-                threshold_db=20,
+                RLdata = corrected_data,
+                threshold_db=80,
                 diveId ='dive_42')
 
 #%% Should we model Pdet as a function of RL?
@@ -127,9 +127,6 @@ for thresh in detThreshs:
                     bin_width_km= .1)
     
 #%% Restrict to sperm whale depths
-
-
-    my_data = genfromtxt('PeakToPeakDive_dive_24_dec.csv', delimiter=',')
 
 # Get the depth values from the HDF5
 import h5py
