@@ -45,14 +45,15 @@ segment = scaleP2P(segment, outP2P= 220)
 
 plt.plot(tt*1000, segment)
 
-
+#%% Use convolution of the signal of interest to calculate the peak to peak
+# RL at each of the sensor locations
 
 # Calculate the received arrays and export to csv- this takes a while
 CreateOutputCSVs(h5_path,segment, samplerate, out_path, nWorkers=56)
 
 
 #%% Load the RL grid in the previous section and make plots 
-RLdata = np.genfromtxt('X:\\Kaitlin_Palmer\\CalCurCEAS_propagation_csvs\\PeakToPeak_dive_42_GliderDepth_200m.csv', delimiter=',')
+RLdata = np.genfromtxt('X:\\Kaitlin_Palmer\\CalCurCEAS_propagation_csvs\\PeakToPeak_dive_42_GliderDepth_800m.csv', delimiter=',')
 np.nanmax(RLdata)
 
 # The impulse response was created using a bellhop model at 35khz and the
