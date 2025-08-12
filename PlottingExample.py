@@ -10,16 +10,19 @@ should be the begining of a package
 
 from scipy.io import wavfile
 import os
+from PlottingDefs import CreateOutputCSVs
 from PlottingDefs import scaleP2P, CreateOutputCSVs, alphaAdjustment
 from PlottingDefs import apply_alpha_correction, plot_peak2peak_isosurfaces, plot_detection_probability
 from PlottingDefs import plot_detection_vs_range, plot_detection_by_bearing
+
+
 import numpy as np
 import matplotlib.pyplot as plt
 
 #%% Creat the CSV's of the arrival RLs
 # File locations for the HDF5 from the bellhop models, audio file to convolve
 # and where to save th exported csvs
-h5_path = 'X:\Kaitlin_Palmer\CalCurCEAS_propagation_hdf5s\Spacious_CalCurses_Sensitivity_PCHIP_35khz_20km_800m.h5'
+h5_path = 'C:\\Users\\pam_user\\Documents\\GitHub\\SPACIOUS-Propagation-Modes\\Spacious_CalCurses_Sensitivity_PCHIP_35khz_20km_500m.h5'
 wav_path = "C:\\Users\\pam_user\\Documents\\GitHub\\SPACIOUS-Propagation-Modes\\ExampleData\\LF_1705_20171028_010934_441.wav"
 out_path = "X:\Kaitlin_Palmer\CalCurCEAS_propagation_csvs"
 
@@ -49,7 +52,7 @@ plt.plot(tt*1000, segment)
 # RL at each of the sensor locations
 
 # Calculate the received arrays and export to csv- this takes a while
-CreateOutputCSVs(h5_path,segment, samplerate, out_path, nWorkers=56)
+CreateOutputCSVs(h5_path, segment, samplerate, out_path, nWorkers=56)
 
 
 #%% Load the RL grid in the previous section and make plots 
@@ -119,7 +122,7 @@ for thresh in detThreshs:
         title=None, s=40)
 
     stats_df = plot_detection_vs_range(h5_path=h5_path,
-                    RLdata=RLdata,
+                    RLdata=corrected_data,
                     threshold_db=thresh,
                     bin_width_km= .1)
     
@@ -151,6 +154,11 @@ plot_peak2peak_isosurfaces(
                 xy_res=200,
                 seabed_color='0.6',
                 elev=25, azim=-90)
+
+plot_detection_probability(h5_path,
+    corrected_data, thresh,
+    cmap='viridis',diveId ='dive_42', vmin=0, vmax=1, 
+    title=None, s=40)
 
 
 
