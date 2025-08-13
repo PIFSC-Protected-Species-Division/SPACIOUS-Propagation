@@ -1014,3 +1014,213 @@ def demo_coherent_pipeline(fs=192000,
                                                  arrivals_include_absorption=arrivals_include_absorption,
                                                  title_suffix=f"(ref {f_ref_hz/1000:.1f} kHz)")
     return dict(segment=segment, t=t, freqs=freqs, arrivals=arrivals, r=r, stats=stats, figs=(fig3, fig4))
+
+
+def fig_pipeline_overview(segment,
+                          fs,
+                          arrivals_dict,
+                          freqs_hz,
+                          f_ref_hz=35000.0,
+                          c_eff_m_s=1480.0,
+                          arrivals_include_absorption=True,
+                          title="Coherent Wideband Propagation Pipeline",
+                          warn=True,
+                          save_path=None):
+    """
+    One-page overview figure of the coherent pipeline:
+      [A] Source click (time)
+      [B] Source |S(f)| (dB) and synthesis grid markers
+      [C] Absorption curves: α(f) and Δα(f) vs f
+      [D] Coherent transfer H(f): |H(f)| and phase
+      [E] Received |S(f)H(f)| (dB)
+      [F] Received waveform (time) with p2p
+
+    Depends on helper functions already in this module:
+      - thorp_alpha_db_per_km(freqs_hz) -> dB/km (array-like)
+      - compute_Hf_from_arrivals(arrivals_dict, freqs_hz, f_ref_hz, c_eff_m_s, arrivals_include_absorption)
+
+    Parameters
+    ----------
+    segment : 1-D np.ndarray
+        Source waveform (click).
+    fs : float
+        Sample rate (Hz).
+    arrivals_dict : dict
+        {"time_of_arrival": ..., "arrival_amplitude": ..., "path_length_m": optional}
+    freqs_hz : 1-D np.ndarray
+        Synthesis frequency grid (Hz).
+    f_ref_hz : float
+        Reference frequency of Bellhop arrivals (Hz).
+    c_eff_m_s : float
+        Effective sound speed for path-length estimation when missing (m/s).
+    arrivals_include_absorption : bool
+        True if Bellhop arrivals already include absorption at f_ref_hz.
+    warn : bool
+        Emit band-mismatch warnings (Nyquist, ref freq).
+    save_path : str or None
+        If provided, saves the figure.
+
+    Returns
+    -------
+    fig : matplotlib.figure.Figure
+    artifacts : dict
+        {"S_native":..., "S_on_grid":..., "Hf":..., "Rspec":..., "received":..., "p2p_db":...}
+    """
+    # ---------------- Guardrails ----------------
+    nyq = 0.5 * fs
+    eff_max = float(np.min([np.max(freqs_hz), 0.49 * fs]))
+    if warn:
+        if np.max(freqs_hz) > nyq:
+            print(f"[pipeline] ⚠️ Frequency grid exceeds Nyquist ({nyq/1000:.1f} kHz); "
+                  f"clamping visually at {eff_max/1000:.1f} kHz.")
+        if f_ref_hz > nyq:
+            print(f"[pipeline] ⚠️ Reference {f_ref_hz/1000:.1f} kHz is above Nyquist "
+                  f"({nyq/1000:.1f} kHz). Coherent synthesis will still run, but "
+                  "the displayed band is limited by the source sampling rate.")
+
+    # ---------------- Source spectrum on native rFFT grid ----------------
+    Npow2 = int(2**np.ceil(np.log2(len(segment))))
+    S_native = np.fft.rfft(segment, n=Npow2)
+    f_rfft = np.fft.rfftfreq(Npow2, d=1.0/fs)
+
+    # Complex resample from native rFFT grid → synthesis grid
+    def _rfft_resample_complex(freqs_out_hz, rfft_vals, fs_hz, n_time):
+        f_rr = np.fft.rfftfreq(n_time, d=1.0/fs_hz)
+        re = np.interp(freqs_out_hz, f_rr, np.real(rfft_vals), left=0.0, right=0.0)
+        im = np.interp(freqs_out_hz, f_rr, np.imag(rfft_vals), left=0.0, right=0.0)
+        return re + 1j * im
+
+    S_on_grid = _rfft_resample_complex(freqs_hz, S_native, fs, Npow2)
+
+    # ---------------- Absorption and Δ-absorption ----------------
+    a_all = thorp_alpha_db_per_km(freqs_hz)                 # dB/km over grid
+    a_ref = float(thorp_alpha_db_per_km(np.array([f_ref_hz]))[0])
+    delta_db_per_km = (a_all - a_ref) if arrivals_include_absorption else a_all
+
+    # ---------------- Coherent transfer H(f) from arrivals ----------------
+    Hf = compute_Hf_from_arrivals(arrivals_dict, freqs_hz, f_ref_hz,
+                                  c_eff_m_s=c_eff_m_s,
+                                  arrivals_include_absorption=arrivals_include_absorption)
+
+    # ---------------- Received spectrum and time-domain waveform ----------------
+    Rspec = S_on_grid * Hf
+
+    def _ifft_from_arbitrary_grid(freqs_in_hz, S_in, fs_hz, n_time):
+        """Map arbitrary-grid complex spectrum onto canonical rFFT grid, then iFFT."""
+        f_rr = np.fft.rfftfreq(n_time, d=1.0/fs_hz)
+        re = np.interp(f_rr, freqs_in_hz, np.real(S_in), left=0.0, right=0.0)
+        im = np.interp(f_rr, freqs_in_hz, np.imag(S_in), left=0.0, right=0.0)
+        return np.fft.irfft(re + 1j*im, n=n_time)
+
+    received = _ifft_from_arbitrary_grid(freqs_hz, Rspec, fs, Npow2)[:len(segment)]
+    p2p_db = 20.0 * np.log10(np.ptp(np.real(received)) + 1e-18)
+
+    # ---------------- Figure layout ----------------
+    fig = plt.figure(figsize=(13.5, 9.5))
+    gs = fig.add_gridspec(3, 3, height_ratios=[1.0, 1.0, 1.1], hspace=0.35, wspace=0.28)
+
+    # A — Source time
+    axA = fig.add_subplot(gs[0, 0])
+    t = np.arange(len(segment)) / fs
+    axA.plot(t*1e3, segment)
+    axA.set_title("A — Source click (time)")
+    axA.set_xlabel("Time (ms)")
+    axA.set_ylabel("Amplitude")
+
+    # B — Source |S(f)| + grid markers
+    axB = fig.add_subplot(gs[0, 1])
+    axB.plot(f_rfft/1000, 20*np.log10(np.abs(S_native)+1e-18), lw=1.2)
+    mask = freqs_hz <= eff_max
+    if np.any(mask):
+        base = np.nanmin(20*np.log10(np.abs(S_native)+1e-18))
+        axB.plot(freqs_hz[mask]/1000, np.full(np.sum(mask), base)+3, '.', ms=2.5)
+    axB.set_title("B — Source |S(f)| and synthesis grid")
+    axB.set_xlabel("Frequency (kHz)")
+    axB.set_ylabel("Level (dB, rel)")
+
+    # C — Absorption α(f) and Δα(f)
+    axC = fig.add_subplot(gs[0, 2])
+    axC.plot(freqs_hz/1000, a_all, label="α(f) (dB/km)")
+    axC.axvline(f_ref_hz/1000, color='k', ls='--', lw=0.8, label=f"f_ref = {f_ref_hz/1000:.1f} kHz")
+    axC2 = axC.twinx()
+    axC2.plot(freqs_hz/1000, delta_db_per_km, color='tab:orange', label="Δα(f) (dB/km)")
+    axC.set_title("C — Absorption and Δ-absorption")
+    axC.set_xlabel("Frequency (kHz)")
+    axC.set_ylabel("α(f) dB/km")
+    axC2.set_ylabel("Δα(f) dB/km")
+    lines, labels = axC.get_legend_handles_labels()
+    lines2, labels2 = axC2.get_legend_handles_labels()
+    axC.legend(lines+lines2, labels+labels2, loc="upper left", fontsize=9)
+
+    # D — |H(f)|
+    axD = fig.add_subplot(gs[1, 0])
+    axD.plot(freqs_hz/1000, 20*np.log10(np.abs(Hf)+1e-18), lw=1.2)
+    axD.set_title("D — |H(f)| from reference arrivals")
+    axD.set_xlabel("Frequency (kHz)")
+    axD.set_ylabel("Mag (dB, rel)")
+
+    # E — ∠H(f)
+    axE1 = fig.add_subplot(gs[1, 1])
+    axE1.plot(freqs_hz/1000, np.unwrap(np.angle(Hf)), lw=1.0)
+    axE1.set_title("E — ∠H(f) (unwrapped)")
+    axE1.set_xlabel("Frequency (kHz)")
+    axE1.set_ylabel("Phase (rad)")
+
+    # F — |S(f)H(f)|
+    axE2 = fig.add_subplot(gs[1, 2])
+    axE2.plot(freqs_hz/1000, 20*np.log10(np.abs(Rspec)+1e-18))
+    axE2.set_title("F — Received spectrum |S(f)H(f)|")
+    axE2.set_xlabel("Frequency (kHz)")
+    axE2.set_ylabel("Level (dB, rel)")
+
+    # G — Received time-domain + p2p
+    axF = fig.add_subplot(gs[2, :])
+    axF.plot(t*1e3, np.real(received), lw=1.2)
+    axF.set_title(f"G — Received time-domain (p2p = {p2p_db:.1f} dB)")
+    axF.set_xlabel("Time (ms)")
+    axF.set_ylabel("Amplitude")
+
+    # --------- Flow arrows with invisible figure-wide axis ---------
+    ann_ax = fig.add_axes([0, 0, 1, 1], zorder=-1)
+    ann_ax.set_axis_off()
+    fig_inv = fig.transFigure.inverted()
+
+    def _arrow(ax_from, ax_to, text):
+        start = fig_inv.transform(ax_from.transAxes.transform((1.02, 0.5)))
+        end   = fig_inv.transform(ax_to.transAxes.transform((-0.02, 0.5)))
+        ann_ax.annotate(
+            text,
+            xy=end, xytext=start,
+            xycoords='figure fraction', textcoords='figure fraction',
+            arrowprops=dict(arrowstyle="->", lw=1.5),
+            va="center", ha="center"
+        )
+
+    _arrow(axA, axB, "FFT")
+    _arrow(axB, axC, "Apply Δα(f)")
+    _arrow(axC, axD, "Build H(f)")
+    _arrow(axD, axE2, "× S(f)")
+    # E2 → F downward arrow
+    start = fig_inv.transform(axE2.transAxes.transform((0.5, -0.1)))
+    end   = fig_inv.transform(axF.transAxes.transform((0.85, 1.05)))
+    ann_ax.annotate(
+        "IFFT",
+        xy=end, xytext=start,
+        xycoords='figure fraction', textcoords='figure fraction',
+        arrowprops=dict(arrowstyle="->", lw=1.5),
+        va="center", ha="center"
+    )
+
+    # Title + subtitle
+    fig.suptitle(title, y=0.995, fontsize=14, fontweight="bold")
+    fig.text(0.008, 0.985,
+             "Reference arrivals set phase/timing (geometry); Δ-absorption shifts amplitude per frequency.\n"
+             "Convolving the resulting impulse response with the source yields a realistic received waveform.",
+             ha="left", va="top", fontsize=9)
+
+    if save_path:
+        fig.savefig(save_path, bbox_inches="tight", dpi=200)
+
+    artifacts = dict(S_native=S_native, S_on_grid=S_on_grid, Hf=Hf,
+                     Rspec=Rspec, received=received, p2p_db=float(p2p_db))
+    return fig, artifacts
