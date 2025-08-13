@@ -142,12 +142,29 @@ arrivals =  load_point_by_index(h5_path,
                         freq_khz='frequency_35000',
                         c_eff_m_s=1480.0, 
                         estimate_pathlen_if_missing=True)
-# your click + fs
-click = click_waveform
-fs = samplerate
 
-freqs = build_freq_grid(20000, 90000, 200, fs=fs)  # will clamp visually to Nyquist if needed
-fig, artifacts = fig_pipeline_overview(click, fs, arrivals, freqs,
+
+# your click 
+# Resample the click, pretend it was sampled at 200khz not 90
+from scipy.io import wavfile
+from scipy import signal
+import numpy as np
+
+
+# Calculate the new number of samples
+num_samples_original = len(click_waveform)
+num_samples_target = int(num_samples_original * (200000 / samplerate))
+
+click200khz = signal.resample(click_waveform, num_samples_target)
+
+# Convert back to original data type if necessary (resample often returns float)
+click200khz = click200khz.astype(click_waveform.dtype)
+
+
+
+freqs = build_freq_grid(2000, 90000, 200, fs=fs)  # will clamp visually to Nyquist if needed
+fig, artifacts = fig_pipeline_overview(click200khz, 200000,
+                                       arrivals, freqs,
                                        f_ref_hz=35000.0,
                                        arrivals_include_absorption=True,
                                        title="Coherent Pipeline Overview",
