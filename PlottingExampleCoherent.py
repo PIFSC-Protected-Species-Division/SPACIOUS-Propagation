@@ -59,8 +59,6 @@ plt.plot(tt*1000, segment)
 
 # Calculate the received arrays and export to csv- this takes a while
 
-
-
 CreateOutputCSVs(
     h5_path=h5_path,
     segment=click_waveform,          # your recorded click
@@ -76,109 +74,6 @@ CreateOutputCSVs(
     arrivals_include_absorption=True # typical with arlpy/bellhop
 )
 
-
-
-#%% Load the RL grid in the previous section and make plots 
-RLdata = np.genfromtxt('X:\\Kaitlin_Palmer\\CalCurCEAS_propagation_csvs\\PeakToPeak_dive_42_GliderDepth_500m.csv', delimiter=',')
-np.nanmax(RLdata)
-
-# The impulse response was created using a bellhop model at 35khz and the
-# amplitude is based on 35khz attenuation. If we are interested more in 4khz
-# or similar then we need to increase the amplitude of the impulse response 
-# (less attenuation)
-
-# Simple calcuation to get the change in alpha (db/km) between two frequencies
-# High frequency is absorbed in sea water at higher levels than low frequency
-alphachange = alphaAdjustment(bellhopFreq=35000, newFreq =2000)
-
-# The change in alpha coefficient in absorption is 5.2 dB/km between
-# 35 khz and 2khz so we need to add that back into the RL grids accounting
-# for beam angle. Does not completely account for beam lenght (e.g. bounces) 
-# or change in ssp
-
-# Create the adjusted implse response 
-corrected_data = apply_alpha_correction(h5_path= h5_path, 
-                                        RLdata =RLdata,
-                                        alpha_db_per_km=alphachange, 
-                                        diveId ='dive_42')
-
-# Plot the new iso-surface
-plot_peak2peak_isosurfaces(
-                h5_path, corrected_data, diveId ='dive_42',
-                iso_levels=(80,),
-                xy_res=200,
-                seabed_color='0.6',
-                elev=25, azim=-90)
- 
-plot_detection_probability(h5_path,
-    RLdata, 80,
-    cmap='viridis',diveId ='dive_42', vmin=0, vmax=1, 
-    title=None, s=40)
-
-stats_df = plot_detection_vs_range(h5_path=h5_path,
-                RLdata=corrected_data,
-                threshold_db=80,
-                bin_width_km= .1)
-
-stats_dict = plot_detection_by_bearing( 
-                h5_path= h5_path,
-                RLdata = corrected_data,
-                threshold_db=80,
-                diveId ='dive_42')
-
-#%% Should we model Pdet as a function of RL?
-
-detThreshs = [20,40,80]
-
-for thresh in detThreshs:
-    # Plot the new iso-surface
-    plot_peak2peak_isosurfaces(
-                    h5_path, corrected_data, diveId ='dive_42',
-                    iso_levels=(thresh,),
-                    xy_res=200,
-                    seabed_color='0.6',
-                    elev=25, azim=-90)
-     
-    plot_detection_probability(h5_path,
-        RLdata, thresh,
-        cmap='viridis',diveId ='dive_42', vmin=0, vmax=1, 
-        title=None, s=40)
-
-    stats_df = plot_detection_vs_range(h5_path=h5_path,
-                    RLdata=corrected_data,
-                    threshold_db=thresh,
-                    bin_width_km= .1)
-    
-#%% Restrict to sperm whale depths
-
-# Get the depth values from the HDF5
-import h5py
-
-# Now get the depths
-hf = h5py.File(h5_path, 'r')
-diveId ='dive_42'
-dive_grp = hf[f'drift_01/{diveId}/frequency_35000']
-run_ids = list(dive_grp['arrivals'].keys())
-depth_grid = np.array(dive_grp['depth'])
-
-# Say 500m to 1200m depth that's column 5 on
-np.nanmax(corrected_data)
-corrected_data[:, 1:4] = -500
-corrected_data[:, 13:27] = -500
-
-
-# Plot the new iso-surface
-plot_peak2peak_isosurfaces(
-                h5_path, corrected_data, diveId ='dive_42',
-                iso_levels=(80,),
-                xy_res=200,
-                seabed_color='0.6',
-                elev=25, azim=-90)
-
-plot_detection_probability(h5_path,
-    corrected_data, thresh,
-    cmap='viridis',diveId ='dive_42', vmin=0, vmax=1, 
-    title=None, s=40)
 
 
 #%% Pipeline Examples
@@ -221,11 +116,58 @@ fig4, stats = fig_compare_legacy_vs_coherent(click, fs, arrivals, freqs,
                                              c_eff_m_s=1480.0,
                                              arrivals_include_absorption=True)
 
+thresh =30
 
 plot_peak2peak_isosurfaces(
                 h5_path, RLdata, diveId ='dive_24_dec',
-                iso_levels=(30,),
+                iso_levels=(thresh,),
                 xy_res=200,
                 seabed_color='0.6',
                 elev=25, azim=-90)
+
+plot_detection_probability(h5_path,
+    RLdata, thresh,
+    cmap='viridis',diveId ='dive_24_dec', vmin=0, vmax=1, 
+    title=None, s=40)
+#%% Pipeline Plots
+from PlottingDefs import build_freq_grid, fig_pipeline_overview
+from H5ArrivalsBridge import load_point_by_index
+
+h5 = "Spacious_CalCurses_Sensitivity_PCHIP_35khz_20km.h5"
+dive_id = "dive_24_dec"
+arrivals =  load_point_by_index(h5_path, 
+                        dive_id, 
+                        pt_index ='pt_00001',
+                        drift_id=drift_id, 
+                        freq_khz='frequency_35000',
+                        c_eff_m_s=1480.0, 
+                        estimate_pathlen_if_missing=True)
+
+
+# your click 
+# Resample the click, pretend it was sampled at 200khz not 90
+from scipy.io import wavfile
+from scipy import signal
+import numpy as np
+
+
+# Calculate the new number of samples
+num_samples_original = len(click_waveform)
+num_samples_target = int(num_samples_original * (200000 / samplerate))
+
+click200khz = signal.resample(click_waveform, num_samples_target)
+
+# Convert back to original data type if necessary (resample often returns float)
+click200khz = click200khz.astype(click_waveform.dtype)
+
+
+
+freqs = build_freq_grid(2000, 90000, 200, fs=fs)  # will clamp visually to Nyquist if needed
+fig, artifacts = fig_pipeline_overview(click200khz, 200000,
+                                       arrivals, freqs,
+                                       f_ref_hz=35000.0,
+                                       arrivals_include_absorption=True,
+                                       title="Coherent Pipeline Overview",
+                                       save_path=None)  # or "pipeline.svg"
+
 

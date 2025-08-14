@@ -43,10 +43,9 @@ geod = Geod(ellps="WGS84")
 
 def scaleP2P(segment: np.ndarray, outP2P: float = 220.0) -> np.ndarray:
     """Scale 'segment' so its peak-to-peak is 'outP2P' dB (re linear units)."""
-    init_p2pdB = 20.0 * np.log10(np.ptp(segment))
+    init_p2pdB = 20.0 * np.log10(np.ptp(segment) + 1e-18)
     gain = 10 ** ((outP2P - init_p2pdB) / 20.0)
     return segment * gain
-
 
 def arrivals_to_impulse_response(arrivals: dict, fs: int, abs_time: bool = False) -> np.ndarray:
     """Convert sparse arrivals (toa, amp) into a complex-valued impulse response."""
@@ -56,20 +55,104 @@ def arrivals_to_impulse_response(arrivals: dict, fs: int, abs_time: bool = False
     irlen = int(np.ceil((np.max(toa) - t0) * fs)) + 1
     ir = np.zeros(irlen, dtype=np.complex128)
     for i in range(len(toa)):
-        ndx = int(np.round((toa[i].real - t0) * fs))
+        ndx = int(np.round((toa[i] - t0) * fs))
         if 0 <= ndx < irlen:
             ir[ndx] = amp[i]
     return ir
-
 
 def p2pArrivalSNR(arrivals: dict, segment: np.ndarray, fs: int):
     """Convolve segment with IR → return peak-to-peak level (dB) and the waveform."""
     ir = arrivals_to_impulse_response(arrivals, fs=fs, abs_time=False)
     out_sig = np.convolve(segment, ir)[:len(segment)]
     out_real = np.real(out_sig)
-    p2p_db = 20.0 * np.log10(np.ptp(out_real))
+    p2p_db = 20.0 * np.log10(np.ptp(out_real) + 1e-18)
     return np.round(p2p_db, 1), out_real
 
+# ========= Coherent multi-frequency synthesis =========
+
+def thorp_alpha_db_per_km(f_hz: np.ndarray) -> np.ndarray:
+    """
+    Classic Thorp absorption (dB/km) for seawater (sufficient at 1–100 kHz).
+    f_hz can be scalar or array. Returns dB/km.
+    """
+    f = np.maximum(np.asarray(f_hz), 1.0) / 1000.0  # kHz, avoid f=0
+    a = 0.11 * (f**2 / (1 + f**2)) + 44 * (f**2 / (4100 + f**2)) + 2.75e-4 * f**2 + 0.003
+    return a
+
+def _build_freq_grid(fmin_hz=20000.0, fmax_hz=90000.0, df_hz=200.0):
+    """Uniform frequency grid for coherent synthesis."""
+    n = int(np.floor((fmax_hz - fmin_hz) / df_hz)) + 1
+    return fmin_hz + df_hz * np.arange(n)
+
+def _safe_irfft_on_grid(freqs, spec_vals, n_time, fs):
+    """
+    spec_vals is defined on 'freqs' (linear Hz). We need an rfft grid to irfft.
+    We resample onto the canonical rfft grid for length n_time, fs.
+    """
+    f_rfft = np.fft.rfftfreq(n_time, d=1.0/fs)
+    # complex interpolation: linear on real/imag parts
+    re = np.interp(f_rfft, freqs, np.real(spec_vals), left=0.0, right=0.0)
+    im = np.interp(f_rfft, freqs, np.imag(spec_vals), left=0.0, right=0.0)
+    return np.fft.irfft(re + 1j*im, n=n_time)
+
+def p2pArrivalSNR_coherent(arrivals: dict,
+                           segment: np.ndarray,
+                           fs: int,
+                           freqs_hz: np.ndarray,
+                           alpha_model="thorp",
+                           c_eff_m_s: float = 1480.0,
+                           f_ref_hz: float = 35000.0,
+                           arrivals_include_absorption: bool = True):
+    """
+    Coherent multi-frequency synthesis using a Bellhop ray set at f_ref_hz.
+    If arrivals already include absorption at f_ref_hz (typical) set
+    arrivals_include_absorption=True (default) to use Δ-absorption.
+    """
+    # FFT of source on synthesis grid (zero-pad for cleaner IFFT)
+    n_time = int(2**np.ceil(np.log2(len(segment))))
+    S_rfft = np.fft.rfft(segment, n=n_time)
+    f_rfft = np.fft.rfftfreq(n_time, d=1.0/fs)
+    S_f = np.interp(freqs_hz, f_rfft, np.real(S_rfft), left=0.0, right=0.0) \
+        + 1j*np.interp(freqs_hz, f_rfft, np.imag(S_rfft), left=0.0, right=0.0)
+
+    # alpha(f) in dB/km
+    if alpha_model == "thorp":
+        alpha_db_per_km = thorp_alpha_db_per_km(freqs_hz)
+        alpha_ref_db_per_km = float(thorp_alpha_db_per_km(np.array([f_ref_hz]))[0])
+    else:
+        # Hook to your thermodynamic model if desired:
+        alpha_db_per_km = calc_seawater_absorption(freqs_hz) * 1000.0
+        alpha_ref_db_per_km = float(calc_seawater_absorption(f_ref_hz) * 1000.0)
+
+    tau = np.asarray(arrivals.get("time_of_arrival", []), float).reshape(-1)
+    amp = np.asarray(arrivals.get("arrival_amplitude", [])).reshape(-1)
+    path_len = arrivals.get("path_length_m", None)
+    if tau.size == 0 or amp.size == 0:
+        return np.nan, np.zeros_like(segment)
+
+    if path_len is not None and np.isfinite(path_len).any():
+        Rm = np.asarray(path_len, float).reshape(-1)
+    else:
+        Rm = tau * float(c_eff_m_s)
+
+    # Use Δ-alpha if arrivals already include absorption at f_ref
+    if arrivals_include_absorption:
+        delta_alpha_db_per_km = alpha_db_per_km - alpha_ref_db_per_km
+    else:
+        delta_alpha_db_per_km = alpha_db_per_km  # arrivals did NOT include abs.; use full alpha
+
+    delta_alpha_np_per_m = (delta_alpha_db_per_km / 20.0) * np.log(10.0) / 1000.0
+
+    H_f = np.zeros_like(freqs_hz, dtype=np.complex128)
+    for i in range(len(tau)):
+        mag_f = np.exp(-delta_alpha_np_per_m * Rm[i]) * amp[i]   # amp already at f_ref
+        phs_f = np.exp(-1j * 2.0 * np.pi * freqs_hz * tau[i])    # coherent delay term
+        H_f += mag_f * phs_f
+
+    Rspec = S_f * H_f  # assume flat G(f); hook in if you have it
+    r = _safe_irfft_on_grid(freqs_hz, Rspec, n_time=n_time, fs=fs)[:len(segment)]
+    p2p_db = 20.0 * np.log10(np.ptp(np.real(r)) + 1e-18)
+    return float(np.round(p2p_db, 1)), np.real(r)
 
 # =============================================================================
 # Parallel CSV building
@@ -80,47 +163,80 @@ def _enumerate_dives(h5_path: str):
     with h5py.File(h5_path, "r") as hf:
         return list(hf["drift_01"].keys())
 
-
-def process_run(run_id: str, run_index: int, depth_row: np.ndarray,
-                segment: np.ndarray, fs: int, h5_path: str, dive_id: str):
+def process_run(run_id: str,
+                run_index: int,
+                depth_row: np.ndarray,
+                segment: np.ndarray,
+                fs: int,
+                h5_path: str,
+                dive_id: str,
+                coherent: bool = False,
+                fmin_hz: float = 20000.0,
+                fmax_hz: float = 90000.0,
+                df_hz: float = 200.0,
+                c_eff_m_s: float = 1480.0,
+                f_ref_hz: float = 35000.0,
+                arrivals_include_absorption: bool = True):
     """
     Worker: compute p2p outputs for one run across all depth indices present in depth_row.
-    Returns (run_index, [(depth_idx, p2p_db), ...])
+    If coherent=False → legacy single-IR method.
+    If coherent=True  → wideband coherent synthesis using reference arrivals + α(f).
     """
     required = ("time_of_arrival", "arrival_amplitude", "tx_depth_ndx", "rx_depth_ndx", "rx_range_ndx")
     results = []
 
     with h5py.File(h5_path, "r") as hf:
-        path = f"drift_01/{dive_id}/frequency_35000/arrivals/{run_id}"
+        path = f"drift_01/{dive_id}/frequency_{int(round(f_ref_hz))}/arrivals/{run_id}" \
+               if f"frequency_{int(round(f_ref_hz))}" in hf[f"drift_01/{dive_id}"] \
+               else f"drift_01/{dive_id}/frequency_35000/arrivals/{run_id}"
         arr0 = hf[path]
         data = {}
         for name in required:
-            if name not in arr0:
-                continue
-            arr = arr0[name][()]
-            # handle masked arrays defensively
-            try:
-                arr = arr.data if hasattr(arr, "data") and getattr(arr, "mask", None) is not None else arr
-            except Exception:
-                pass
-            data[name] = arr.ravel() if np.ndim(arr) > 1 else arr
+            if name in arr0:
+                arr = arr0[name][()]
+                try:
+                    arr = arr.data if hasattr(arr, "data") and getattr(arr, "mask", None) is not None else arr
+                except Exception:
+                    pass
+                data[name] = arr.ravel() if np.ndim(arr) > 1 else arr
+
+        # Optional, if you later add this dataset:
+        if "path_length_m" in arr0:
+            data["path_length_m"] = arr0["path_length_m"][()]
 
         if len(data.get("rx_depth_ndx", [])) == 0:
             return run_index, []
 
-        # Only evaluate for depths that exist in this run's row
+        # Pre-build frequency grid if needed
+        if coherent:
+            fmax_hz = min(fmax_hz, 0.49 * fs)  # Nyquist safety
+            freqs = _build_freq_grid(fmin_hz=fmin_hz, fmax_hz=fmax_hz, df_hz=df_hz)
+
+        # Evaluate only for valid depth indices in this row
         depth_idxs = np.where(depth_row > 0)[0]
         for d_idx in depth_idxs:
             mask = data["rx_depth_ndx"] == d_idx
             if not np.any(mask):
                 results.append((d_idx, np.nan))
                 continue
-            hyd = {k: v[mask] for k, v in data.items()}
-            ptp_out, _ = p2pArrivalSNR(hyd, segment, fs)
-            results.append((d_idx, ptp_out))
+
+            hyd = {k: (v[mask] if k in data else None) for k, v in data.items()}
+
+            if coherent:
+                val_db, _ = p2pArrivalSNR_coherent(
+                    hyd, segment, fs,
+                    freqs_hz=freqs,
+                    alpha_model="thorp",
+                    c_eff_m_s=c_eff_m_s,
+                    f_ref_hz=f_ref_hz,
+                    arrivals_include_absorption=arrivals_include_absorption
+                )
+            else:
+                val_db, _ = p2pArrivalSNR(hyd, segment, fs)
+
+            results.append((d_idx, val_db))
 
     return run_index, results
-
 
 def _choose_executor(prefer_processes: bool):
     """
@@ -136,13 +252,20 @@ def _choose_executor(prefer_processes: bool):
     return (ProcessPoolExecutor if prefer_processes else ThreadPoolExecutor,
             "process" if prefer_processes else "thread")
 
-
 def CreateOutputCSVs(h5_path: str,
                      segment: np.ndarray,
                      samplerate: int,
                      out_path: str,
                      nWorkers: int = 10,
-                     prefer_processes: bool = False):
+                     prefer_processes: bool = False,
+                     # --- NEW knobs (defaults keep legacy behavior) ---
+                     coherent: bool = False,
+                     fmin_hz: float = 20000.0,
+                     fmax_hz: float = 90000.0,
+                     df_hz: float = 200.0,
+                     c_eff_m_s: float = 1480.0,
+                     f_ref_hz: float = 35000.0,
+                     arrivals_include_absorption: bool = True):
     """
     Build per-dive peak-to-peak CSVs in parallel over RUNS.
 
@@ -160,7 +283,11 @@ def CreateOutputCSVs(h5_path: str,
         print(f"Processing dive: {dive_id}")
         # Read lightweight metadata once in parent
         with h5py.File(h5_path, "r") as hf:
-            dive_grp = hf[f"drift_01/{dive_id}/frequency_35000"]
+            # Default group (35000) remains backward compatible
+            grp_key = f"drift_01/{dive_id}/frequency_{int(round(f_ref_hz))}"
+            if grp_key not in hf:
+                grp_key = f"drift_01/{dive_id}/frequency_35000"
+            dive_grp = hf[grp_key]
             run_ids = list(dive_grp["arrivals"].keys())
             depth_grid = np.array(dive_grp["depth"])
             drifter_depth = float(dive_grp.parent.attrs["drifter_depth"])
@@ -169,13 +296,19 @@ def CreateOutputCSVs(h5_path: str,
 
         Executor, mode = _choose_executor(prefer_processes)
 
+        # Nyquist safety even if caller passes silly fmax
+        if coherent:
+            fmax_hz = min(fmax_hz, 0.49 * samplerate)
+
         with Executor(max_workers=nWorkers) as pool:
             futures = []
             for run_index, run_id in enumerate(run_ids):
                 depth_row = depth_grid[run_index, :]
                 futures.append(pool.submit(
                     process_run, run_id, run_index, depth_row,
-                    segment, samplerate, h5_path, dive_id
+                    segment, samplerate, h5_path, dive_id,
+                    coherent, fmin_hz, fmax_hz, df_hz, c_eff_m_s,
+                    f_ref_hz, arrivals_include_absorption
                 ))
 
             for fut in tqdm(futures, desc=f"Dive {dive_id}"):
@@ -188,9 +321,8 @@ def CreateOutputCSVs(h5_path: str,
         np.savetxt(out_file, p2p_grid, delimiter=",")
         print(f"Saved: {out_file}")
 
-
 # =============================================================================
-# Frequency-dependent absorption
+# Frequency-dependent absorption (thermodynamic models)
 # =============================================================================
 
 def calc_seawater_absorption(frequency, distance=1000, temperature=27,
@@ -244,17 +376,15 @@ def calc_seawater_absorption(frequency, distance=1000, temperature=27,
         raise ValueError("Unknown formula source")
     return sea_abs
 
-
 def alphaAdjustment(bellhopFreq: float = 35000, newFreq: float = 2000) -> float:
     """Difference in absorption coefficient (dB/km) between two frequencies."""
     a1 = calc_seawater_absorption(bellhopFreq)
     a2 = calc_seawater_absorption(newFreq)
     return (a1 - a2) * 1000.0  # dB/km
 
-
 def apply_alpha_correction(h5_path: str, RLdata: np.ndarray, alpha_db_per_km: float,
                            diveId: str = "dive_42") -> np.ndarray:
-    """Apply slant-range alpha correction to RL grid."""
+    """Apply slant-range alpha correction to RL grid (what-if analysis)."""
     with h5py.File(h5_path, "r") as hf:
         grp = hf[f"drift_01/{diveId}/frequency_35000"]
         depth_grid = np.array(grp["depth"])
@@ -280,7 +410,6 @@ def apply_alpha_correction(h5_path: str, RLdata: np.ndarray, alpha_db_per_km: fl
             slant_km = np.hypot(horiz_km, vertical_km)
             corrected[i, j] = val + alpha_db_per_km * slant_km
     return corrected
-
 
 # =============================================================================
 # Plotting
@@ -379,7 +508,6 @@ def plot_peak2peak_isosurfaces(h5_path: str, pp_grid: np.ndarray, diveId: str = 
     plt.tight_layout()
     plt.show()
 
-
 def plot_detection_probability(h5_path: str, RLdata: np.ndarray, threshold_db: float,
                                cmap="viridis", diveId: str = "dive_42", vmin=0, vmax=1,
                                title=None, s=40):
@@ -413,7 +541,6 @@ def plot_detection_probability(h5_path: str, RLdata: np.ndarray, threshold_db: f
     ax.grid(True); ax.axis("equal")
     plt.tight_layout(); plt.show()
     return detection_prob
-
 
 def plot_detection_vs_range(h5_path: str, RLdata: np.ndarray, diveId: str = "dive_42",
                             threshold_db: float = 120.0, bin_width_km: float = 1.0,
@@ -461,11 +588,10 @@ def plot_detection_vs_range(h5_path: str, RLdata: np.ndarray, diveId: str = "div
 
     return pd.DataFrame({"range_km": centers, "median": med, "lower_95": lo95, "upper_95": hi95})
 
-
 def plot_detection_by_bearing(RLdata: np.ndarray, h5_path: str, diveId: str = "dive_42",
                               threshold_db: float = 120.0, bearing_bin_width: float = 10.0,
                               range_bin_width_km: float = 0.2, min_range_km: float = 0.0,
-                              max_range_km: float =20, cmap="turbo", alpha=0.6,
+                              max_range_km: float = 20, cmap="turbo", alpha=0.6,
                               title=None):
     """Median detection probability vs range for each bearing sector."""
     from matplotlib.cm import get_cmap
@@ -485,7 +611,7 @@ def plot_detection_by_bearing(RLdata: np.ndarray, h5_path: str, diveId: str = "d
     bearings = np.zeros(N); ranges_km = np.zeros(N)
     for i in range(N):
         az12, _, dist_m = geod.inv(drifter_lon, drifter_lat, lon[i], lat[i])
-        bearings[i] = az12 % 360.0
+        bearings[i] = (az12 % 360.0)
         ranges_km[i] = dist_m / 1000.0
 
     if max_range_km is None:
@@ -525,7 +651,6 @@ def plot_detection_by_bearing(RLdata: np.ndarray, h5_path: str, diveId: str = "d
     # ax.legend(loc='center left', bbox_to_anchor=(1.02, 0.5))
     plt.tight_layout(); plt.show()
     return stats_by_bearing
-
 
 # =============================================================================
 # Hazard-rate fitting
@@ -621,3 +746,481 @@ def fit_and_plot_hazard_rate_by_location(my_data: np.ndarray,
     print(f"✅ Fitted params: σ = {popt[0]:.3f}, b = {popt[1]:.3f}")
 
     return pd.DataFrame({"range_km": smooth_range, "mean": y_fit, "lower_95": lower, "upper_95": upper})
+# -*- coding: utf-8 -*-
+"""
+PlottingFigures.py — figure helpers to visualize the coherent wideband pipeline.
+
+Depends on numpy and matplotlib only (plus your PlottingDefs methods if you import them).
+"""
+
+import numpy as np
+
+# ---------- Light-weight re-impl of bits used by the figures ----------
+
+
+def build_freq_grid(fmin_hz=2e4, fmax_hz=9e4, df_hz=200.0, fs=None):
+    """Uniform frequency grid; clamps to ~Nyquist if fs is provided."""
+    if fs is not None:
+        fmax_hz = min(fmax_hz, 0.49 * fs)
+    n = int(np.floor((fmax_hz - fmin_hz) / df_hz)) + 1
+    return fmin_hz + df_hz * np.arange(n)
+
+def rfft_resample_complex(freqs_out, rfft_vals, fs, n_time):
+    """Interpolate a native rfft spectrum (on np.fft.rfftfreq grid) onto freqs_out (Hz)."""
+    f_rfft = np.fft.rfftfreq(n_time, d=1.0/fs)
+    re = np.interp(freqs_out, f_rfft, np.real(rfft_vals), left=0.0, right=0.0)
+    im = np.interp(freqs_out, f_rfft, np.imag(rfft_vals), left=0.0, right=0.0)
+    return re + 1j * im
+
+def ifft_from_arbitrary_grid(freqs_in_hz, S_in, fs, n_time):
+    """Map arbitrary-grid complex spectrum to native rfft grid and IFFT to time."""
+    f_rfft = np.fft.rfftfreq(n_time, d=1.0/fs)
+    re = np.interp(f_rfft, freqs_in_hz, np.real(S_in), left=0.0, right=0.0)
+    im = np.interp(f_rfft, freqs_in_hz, np.imag(S_in), left=0.0, right=0.0)
+    return np.fft.irfft(re + 1j*im, n=n_time)
+
+# ---------- Synthetic test content (optional) ----------
+
+def make_synthetic_click(fs=192000, dur_ms=5.0, f0=40000.0, bw_frac=0.6, taper=0.2, seed=1):
+    """
+    Narrow impulse-like click: Gaussian-modulated tone (center ~f0, fractional BW).
+    Returns segment (float64), time vector (s).
+    """
+    rng = np.random.default_rng(seed)
+    N = int(np.round(dur_ms * 1e-3 * fs))
+    N = max(N, 256)
+    t = np.arange(N) / fs
+    sigma = (dur_ms * 1e-3) * bw_frac / 6.0
+    env = np.exp(-0.5 * ((t - t.mean()) / (sigma + 1e-12))**2)
+    phase = 2*np.pi*f0*(t - t.mean())
+    click = env * np.cos(phase)
+    # small random phase dither to avoid pathological symmetry
+    click += 0.01 * rng.standard_normal(N) * env
+    # cosine taper
+    M = int(taper * N)
+    if M > 0:
+        win = np.ones(N)
+        ramp = 0.5*(1 - np.cos(np.pi*np.arange(M)/M))
+        win[:M] *= ramp
+        win[-M:] *= ramp[::-1]
+        click *= win
+    return (click / (np.max(np.abs(click)) + 1e-12)).astype(float), t
+
+def make_synthetic_arrivals(f_ref_hz=35000.0, c_eff=1480.0):
+    """
+    Simple 3-path synthetic arrivals at the reference frequency:
+    each path has complex amplitude (phase at f_ref) + delay.
+    Returns dict(time_of_arrival, arrival_amplitude, path_length_m).
+    """
+    # Delays (s)
+    tau = np.array([0.020, 0.0228, 0.0285])  # direct, surface, bottom (example)
+    # Geometric path lengths (m) ~ tau * c
+    R = tau * c_eff
+    # Amplitudes (include spreading/geo loss baked into |A|); phases at f_ref:
+    # Choose relative phases to mimic interference
+    phases = 2*np.pi*f_ref_hz*tau + np.array([0.0, +0.7*np.pi, -0.3*np.pi])
+    mags = np.array([1.0, 0.55, 0.35])  # arbitrary but plausible scaling
+    A = mags * np.exp(1j * phases)
+    return dict(time_of_arrival=tau, arrival_amplitude=A, path_length_m=R)
+
+# ---------- Figure helpers (reusable) ----------
+
+def fig_source_and_grid(segment, fs, freqs_hz, title_suffix=""):
+    """Plot source waveform, magnitude spectrum, and synthesis grid."""
+    Npow2 = int(2**np.ceil(np.log2(len(segment))))
+    S = np.fft.rfft(segment, n=Npow2)
+    f_rfft = np.fft.rfftfreq(Npow2, d=1.0/fs)
+
+    fig, axs = plt.subplots(1, 3, figsize=(14, 3.5))
+    t = np.arange(len(segment)) / fs
+    axs[0].plot(t*1e3, segment)
+    axs[0].set_title("Source click (time)"); axs[0].set_xlabel("Time (ms)")
+
+    axs[1].plot(f_rfft/1000, 20*np.log10(np.abs(S)+1e-18))
+    axs[1].set_title("Source |S(f)| (dB)"); axs[1].set_xlabel("Frequency (kHz)")
+
+    axs[2].plot(freqs_hz/1000, np.zeros_like(freqs_hz), '.', ms=3)
+    axs[2].set_ylim(-1, +1)
+    axs[2].set_title("Synthesis grid freqs"); axs[2].set_xlabel("Frequency (kHz)")
+    fig.suptitle(f"Source & Grid {title_suffix}", y=1.02)
+    fig.tight_layout()
+    return fig
+
+def fig_absorption(freqs_hz, f_ref_hz=35000.0, model="thorp", title_suffix=""):
+    """Plot α(f) and Δα(f)=α(f)−α(f_ref) in dB/km."""
+    if model == "thorp":
+        a_all = thorp_alpha_db_per_km(freqs_hz)
+        a_ref = float(thorp_alpha_db_per_km(np.array([f_ref_hz]))[0])
+    else:
+        raise NotImplementedError("Only Thorp in this light-weight helper")
+
+    fig, axs = plt.subplots(1, 2, figsize=(10, 3.8))
+    axs[0].plot(freqs_hz/1000, a_all)
+    axs[0].axvline(f_ref_hz/1000, color='k', ls='--', lw=0.8)
+    axs[0].set_title("Absorption α(f) (dB/km)")
+    axs[0].set_xlabel("Frequency (kHz)")
+
+    axs[1].plot(freqs_hz/1000, a_all - a_ref)
+    axs[1].axhline(0, color='k', lw=0.8)
+    axs[1].set_title("Δα(f) = α(f) − α(f_ref) (dB/km)")
+    axs[1].set_xlabel("Frequency (kHz)")
+
+    fig.suptitle(f"Absorption model ({model}) {title_suffix}", y=1.02)
+    fig.tight_layout()
+    return fig
+
+def compute_Hf_from_arrivals(arrivals, freqs_hz, f_ref_hz=35000.0,
+                             c_eff_m_s=1480.0, arrivals_include_absorption=True):
+    """
+    Build coherent transfer function H(f) from arrivals at f_ref.
+    If arrivals include absorption at f_ref, we apply Δα(f) only.
+    """
+    tau = np.asarray(arrivals["time_of_arrival"], float).reshape(-1)
+    Aref = np.asarray(arrivals["arrival_amplitude"]).reshape(-1)
+    if "path_length_m" in arrivals and arrivals["path_length_m"] is not None:
+        Rm = np.asarray(arrivals["path_length_m"], float).reshape(-1)
+    else:
+        Rm = tau * c_eff_m_s
+
+    a_all = thorp_alpha_db_per_km(freqs_hz)            # dB/km
+    a_ref = float(thorp_alpha_db_per_km(np.array([f_ref_hz]))[0])
+    if arrivals_include_absorption:
+        delta_db_per_km = a_all - a_ref
+    else:
+        delta_db_per_km = a_all
+
+    # convert Δα (dB/km) to Np/m
+    delta_np_per_m = (delta_db_per_km / 20.0) * np.log(10.0) / 1000.0
+
+    Hf = np.zeros_like(freqs_hz, dtype=np.complex128)
+    for i in range(len(tau)):
+        mag = np.exp(-delta_np_per_m * Rm[i]) * Aref[i]
+        phs = np.exp(-1j * 2*np.pi*freqs_hz * tau[i])
+        Hf += mag * phs
+    return Hf
+
+def fig_transfer_and_received(segment, fs, arrivals, freqs_hz,
+                              f_ref_hz=35000.0, c_eff_m_s=1480.0,
+                              arrivals_include_absorption=True, title_suffix=""):
+    """Plot |H(f)|, ∠H(f), received spectrum, and time-domain received click."""
+    # Source spectrum on dense time grid
+    Npow2 = int(2**np.ceil(np.log2(len(segment))))
+    S_native = np.fft.rfft(segment, n=Npow2)
+    S_on_grid = rfft_resample_complex(freqs_hz, S_native, fs, Npow2)
+
+    # Transfer function from arrivals
+    Hf = compute_Hf_from_arrivals(arrivals, freqs_hz, f_ref_hz, c_eff_m_s, arrivals_include_absorption)
+    Rspec = S_on_grid * Hf
+    r = ifft_from_arbitrary_grid(freqs_hz, Rspec, fs, Npow2)[:len(segment)]
+
+    fig, axs = plt.subplots(2, 2, figsize=(11, 7))
+
+    axs[0,0].plot(freqs_hz/1000, 20*np.log10(np.abs(Hf) + 1e-18))
+    axs[0,0].set_title("|H(f)| (dB)"); axs[0,0].set_xlabel("Frequency (kHz)")
+
+    axs[0,1].plot(freqs_hz/1000, np.unwrap(np.angle(Hf)))
+    axs[0,1].set_title("∠H(f) (rad)"); axs[0,1].set_xlabel("Frequency (kHz)")
+
+    axs[1,0].plot(freqs_hz/1000, 20*np.log10(np.abs(Rspec) + 1e-18))
+    axs[1,0].set_title("|S(f)H(f)| (received) (dB)"); axs[1,0].set_xlabel("Frequency (kHz)")
+
+    t = np.arange(len(r))/fs
+    axs[1,1].plot(t*1e3, r.real)
+    p2p_db = 20*np.log10(np.ptp(r.real) + 1e-18)
+    axs[1,1].set_title(f"Received time-domain (p2p = {p2p_db:.1f} dB)")
+    axs[1,1].set_xlabel("Time (ms)")
+
+    fig.suptitle(f"Coherent synthesis from arrivals {title_suffix}", y=1.02)
+    fig.tight_layout()
+    return fig, r
+
+def fig_compare_legacy_vs_coherent(segment, fs, arrivals, freqs_hz,
+                                   f_ref_hz=35000.0, c_eff_m_s=1480.0,
+                                   arrivals_include_absorption=True, title_suffix=""):
+    """
+    Compare legacy single-IR convolution vs coherent wideband pipeline (p2p and waveforms).
+    """
+    # Legacy single-IR (stick arrivals at sample times, no Δα(f))
+    tau = np.asarray(arrivals["time_of_arrival"], float).reshape(-1)
+    Aref = np.asarray(arrivals["arrival_amplitude"]).reshape(-1)
+    t0 = np.min(tau); N_ir = int(np.ceil((np.max(tau) - t0)*fs)) + 1
+    ir = np.zeros(N_ir, dtype=complex)
+    for i in range(len(tau)):
+        n = int(np.round((tau[i]-t0)*fs))
+        if 0 <= n < N_ir:
+            ir[n] += Aref[i]
+    legacy = np.convolve(segment, ir)[:len(segment)].real
+    legacy_p2p = 20*np.log10(np.ptp(legacy) + 1e-18)
+
+    # Coherent
+    _, coherent = fig_transfer_and_received(segment, fs, arrivals, freqs_hz,
+                                            f_ref_hz, c_eff_m_s,
+                                            arrivals_include_absorption, title_suffix="")
+    coh_p2p = 20*np.log10(np.ptp(coherent.real) + 1e-18)
+
+    # Plot comparison
+    fig, axs = plt.subplots(2, 1, figsize=(11, 6), sharex=True)
+    t = np.arange(len(segment))/fs
+    axs[0].plot(t*1e3, legacy, label=f"Legacy IR (p2p={legacy_p2p:.1f} dB)")
+    axs[0].legend(); axs[0].set_title("Legacy single-IR time-domain")
+    axs[0].set_ylabel("Amplitude (arb)")
+
+    axs[1].plot(t*1e3, coherent.real, label=f"Coherent wideband (p2p={coh_p2p:.1f} dB)")
+    axs[1].legend(); axs[1].set_title("Coherent wideband time-domain")
+    axs[1].set_xlabel("Time (ms)"); axs[1].set_ylabel("Amplitude (arb)")
+
+    fig.suptitle(f"Legacy vs Coherent {title_suffix}", y=1.02)
+    fig.tight_layout()
+    return fig, dict(p2p_legacy=legacy_p2p, p2p_coherent=coh_p2p)
+
+# ---------- Convenience end-to-end demo ----------
+
+def demo_coherent_pipeline(fs=192000,
+                           fmin_hz=20000.0, fmax_hz=90000.0, df_hz=200.0,
+                           f_ref_hz=35000.0, arrivals_include_absorption=True):
+    """
+    One-call demo that generates a synthetic click & arrivals and produces 4 figures:
+      1. Source & synthesis grid
+      2. α(f) and Δα(f)
+      3. H(f), received spectrum, received time-domain
+      4. Legacy vs Coherent comparison
+    Returns a dict with the generated arrays for optional inspection.
+    """
+    # source
+    segment, t = make_synthetic_click(fs=fs, dur_ms=5.0, f0=40000.0, bw_frac=0.7)
+    # freq grid
+    freqs = build_freq_grid(fmin_hz, fmax_hz, df_hz, fs=fs)
+    freqs = freqs[(freqs > 0) & (freqs < 0.49*fs)]  # safety clamp
+    # arrivals @ f_ref
+    arrivals = make_synthetic_arrivals(f_ref_hz=f_ref_hz, c_eff=1480.0)
+
+    # 1) source & grid
+    fig_source_and_grid(segment, fs, freqs, title_suffix=f"(fs={fs/1000:.1f} kHz)")
+
+    # 2) absorption
+    fig_absorption(freqs, f_ref_hz=f_ref_hz, model="thorp", title_suffix=f"(f_ref={f_ref_hz/1000:.1f} kHz)")
+
+    # 3) H(f) and received
+    fig3, r = fig_transfer_and_received(segment, fs, arrivals, freqs,
+                                        f_ref_hz=f_ref_hz,
+                                        c_eff_m_s=1480.0,
+                                        arrivals_include_absorption=arrivals_include_absorption,
+                                        title_suffix=f"(Δα from {f_ref_hz/1000:.1f} kHz)")
+
+    # 4) legacy vs coherent comparison
+    fig4, stats = fig_compare_legacy_vs_coherent(segment, fs, arrivals, freqs,
+                                                 f_ref_hz=f_ref_hz,
+                                                 c_eff_m_s=1480.0,
+                                                 arrivals_include_absorption=arrivals_include_absorption,
+                                                 title_suffix=f"(ref {f_ref_hz/1000:.1f} kHz)")
+    return dict(segment=segment, t=t, freqs=freqs, arrivals=arrivals, r=r, stats=stats, figs=(fig3, fig4))
+
+
+def fig_pipeline_overview(segment,
+                          fs,
+                          arrivals_dict,
+                          freqs_hz,
+                          f_ref_hz=35000.0,
+                          c_eff_m_s=1480.0,
+                          arrivals_include_absorption=True,
+                          title="Coherent Wideband Propagation Pipeline",
+                          warn=True,
+                          save_path=None):
+    """
+    One-page overview figure of the coherent pipeline:
+      [A] Source click (time)
+      [B] Source |S(f)| (dB) and synthesis grid markers
+      [C] Absorption curves: α(f) and Δα(f) vs f
+      [D] Coherent transfer H(f): |H(f)| and phase
+      [E] Received |S(f)H(f)| (dB)
+      [F] Received waveform (time) with p2p
+
+    Depends on helper functions already in this module:
+      - thorp_alpha_db_per_km(freqs_hz) -> dB/km (array-like)
+      - compute_Hf_from_arrivals(arrivals_dict, freqs_hz, f_ref_hz, c_eff_m_s, arrivals_include_absorption)
+
+    Parameters
+    ----------
+    segment : 1-D np.ndarray
+        Source waveform (click).
+    fs : float
+        Sample rate (Hz).
+    arrivals_dict : dict
+        {"time_of_arrival": ..., "arrival_amplitude": ..., "path_length_m": optional}
+    freqs_hz : 1-D np.ndarray
+        Synthesis frequency grid (Hz).
+    f_ref_hz : float
+        Reference frequency of Bellhop arrivals (Hz).
+    c_eff_m_s : float
+        Effective sound speed for path-length estimation when missing (m/s).
+    arrivals_include_absorption : bool
+        True if Bellhop arrivals already include absorption at f_ref_hz.
+    warn : bool
+        Emit band-mismatch warnings (Nyquist, ref freq).
+    save_path : str or None
+        If provided, saves the figure.
+
+    Returns
+    -------
+    fig : matplotlib.figure.Figure
+    artifacts : dict
+        {"S_native":..., "S_on_grid":..., "Hf":..., "Rspec":..., "received":..., "p2p_db":...}
+    """
+    # ---------------- Guardrails ----------------
+    nyq = 0.5 * fs
+    eff_max = float(np.min([np.max(freqs_hz), 0.49 * fs]))
+    if warn:
+        if np.max(freqs_hz) > nyq:
+            print(f"[pipeline] ⚠️ Frequency grid exceeds Nyquist ({nyq/1000:.1f} kHz); "
+                  f"clamping visually at {eff_max/1000:.1f} kHz.")
+        if f_ref_hz > nyq:
+            print(f"[pipeline] ⚠️ Reference {f_ref_hz/1000:.1f} kHz is above Nyquist "
+                  f"({nyq/1000:.1f} kHz). Coherent synthesis will still run, but "
+                  "the displayed band is limited by the source sampling rate.")
+
+    # ---------------- Source spectrum on native rFFT grid ----------------
+    Npow2 = int(2**np.ceil(np.log2(len(segment))))
+    S_native = np.fft.rfft(segment, n=Npow2)
+    f_rfft = np.fft.rfftfreq(Npow2, d=1.0/fs)
+
+    # Complex resample from native rFFT grid → synthesis grid
+    def _rfft_resample_complex(freqs_out_hz, rfft_vals, fs_hz, n_time):
+        f_rr = np.fft.rfftfreq(n_time, d=1.0/fs_hz)
+        re = np.interp(freqs_out_hz, f_rr, np.real(rfft_vals), left=0.0, right=0.0)
+        im = np.interp(freqs_out_hz, f_rr, np.imag(rfft_vals), left=0.0, right=0.0)
+        return re + 1j * im
+
+    S_on_grid = _rfft_resample_complex(freqs_hz, S_native, fs, Npow2)
+
+    # ---------------- Absorption and Δ-absorption ----------------
+    a_all = thorp_alpha_db_per_km(freqs_hz)                 # dB/km over grid
+    a_ref = float(thorp_alpha_db_per_km(np.array([f_ref_hz]))[0])
+    delta_db_per_km = (a_all - a_ref) if arrivals_include_absorption else a_all
+
+    # ---------------- Coherent transfer H(f) from arrivals ----------------
+    Hf = compute_Hf_from_arrivals(arrivals_dict, freqs_hz, f_ref_hz,
+                                  c_eff_m_s=c_eff_m_s,
+                                  arrivals_include_absorption=arrivals_include_absorption)
+
+    # ---------------- Received spectrum and time-domain waveform ----------------
+    Rspec = S_on_grid * Hf
+
+    def _ifft_from_arbitrary_grid(freqs_in_hz, S_in, fs_hz, n_time):
+        """Map arbitrary-grid complex spectrum onto canonical rFFT grid, then iFFT."""
+        f_rr = np.fft.rfftfreq(n_time, d=1.0/fs_hz)
+        re = np.interp(f_rr, freqs_in_hz, np.real(S_in), left=0.0, right=0.0)
+        im = np.interp(f_rr, freqs_in_hz, np.imag(S_in), left=0.0, right=0.0)
+        return np.fft.irfft(re + 1j*im, n=n_time)
+
+    received = _ifft_from_arbitrary_grid(freqs_hz, Rspec, fs, Npow2)[:len(segment)]
+    p2p_db = 20.0 * np.log10(np.ptp(np.real(received)) + 1e-18)
+
+    # ---------------- Figure layout ----------------
+    fig = plt.figure(figsize=(13.5, 9.5))
+    gs = fig.add_gridspec(3, 3, height_ratios=[1.0, 1.0, 1.1], hspace=0.35, wspace=0.28)
+
+    # A — Source time
+    axA = fig.add_subplot(gs[0, 0])
+    t = np.arange(len(segment)) / fs
+    axA.plot(t*1e3, segment)
+    axA.set_title("A — Source click (time)")
+    axA.set_xlabel("Time (ms)")
+    axA.set_ylabel("Amplitude")
+
+    # B — Source |S(f)| + grid markers
+    axB = fig.add_subplot(gs[0, 1])
+    axB.plot(f_rfft/1000, 20*np.log10(np.abs(S_native)+1e-18), lw=1.2)
+    mask = freqs_hz <= eff_max
+    if np.any(mask):
+        base = np.nanmin(20*np.log10(np.abs(S_native)+1e-18))
+        axB.plot(freqs_hz[mask]/1000, np.full(np.sum(mask), base)+3, '.', ms=2.5)
+    axB.set_title("B — Source |S(f)| and synthesis grid")
+    axB.set_xlabel("Frequency (kHz)")
+    axB.set_ylabel("Level (dB, rel)")
+
+    # C — Absorption α(f) and Δα(f)
+    axC = fig.add_subplot(gs[0, 2])
+    axC.plot(freqs_hz/1000, a_all, label="α(f) (dB/km)")
+    axC.axvline(f_ref_hz/1000, color='k', ls='--', lw=0.8, label=f"f_ref = {f_ref_hz/1000:.1f} kHz")
+    axC2 = axC.twinx()
+    axC2.plot(freqs_hz/1000, delta_db_per_km, color='tab:orange', label="Δα(f) (dB/km)")
+    axC.set_title("C — Absorption and Δ-absorption")
+    axC.set_xlabel("Frequency (kHz)")
+    axC.set_ylabel("α(f) dB/km")
+    axC2.set_ylabel("Δα(f) dB/km")
+    lines, labels = axC.get_legend_handles_labels()
+    lines2, labels2 = axC2.get_legend_handles_labels()
+    axC.legend(lines+lines2, labels+labels2, loc="upper left", fontsize=9)
+
+    # D — |H(f)|
+    axD = fig.add_subplot(gs[1, 0])
+    axD.plot(freqs_hz/1000, 20*np.log10(np.abs(Hf)+1e-18), lw=1.2)
+    axD.set_title("D — |H(f)| from reference arrivals")
+    axD.set_xlabel("Frequency (kHz)")
+    axD.set_ylabel("Mag (dB, rel)")
+
+    # E — ∠H(f)
+    axE1 = fig.add_subplot(gs[1, 1])
+    axE1.plot(freqs_hz/1000, np.unwrap(np.angle(Hf)), lw=1.0)
+    axE1.set_title("E — ∠H(f) (unwrapped)")
+    axE1.set_xlabel("Frequency (kHz)")
+    axE1.set_ylabel("Phase (rad)")
+
+    # F — |S(f)H(f)|
+    axE2 = fig.add_subplot(gs[1, 2])
+    axE2.plot(freqs_hz/1000, 20*np.log10(np.abs(Rspec)+1e-18))
+    axE2.set_title("F — Received spectrum |S(f)H(f)|")
+    axE2.set_xlabel("Frequency (kHz)")
+    axE2.set_ylabel("Level (dB, rel)")
+
+    # G — Received time-domain + p2p
+    axF = fig.add_subplot(gs[2, :])
+    axF.plot(t*1e3, np.real(received), lw=1.2)
+    axF.set_title(f"G — Received time-domain (p2p = {p2p_db:.1f} dB)")
+    axF.set_xlabel("Time (ms)")
+    axF.set_ylabel("Amplitude")
+
+    # --------- Flow arrows with invisible figure-wide axis ---------
+    ann_ax = fig.add_axes([0, 0, 1, 1], zorder=-1)
+    ann_ax.set_axis_off()
+    fig_inv = fig.transFigure.inverted()
+
+    def _arrow(ax_from, ax_to, text):
+        start = fig_inv.transform(ax_from.transAxes.transform((1.02, 0.5)))
+        end   = fig_inv.transform(ax_to.transAxes.transform((-0.02, 0.5)))
+        ann_ax.annotate(
+            text,
+            xy=end, xytext=start,
+            xycoords='figure fraction', textcoords='figure fraction',
+            arrowprops=dict(arrowstyle="->", lw=1.5),
+            va="center", ha="center"
+        )
+
+    _arrow(axA, axB, "FFT")
+    _arrow(axB, axC, "Apply Δα(f)")
+    _arrow(axC, axD, "Build H(f)")
+    _arrow(axD, axE2, "× S(f)")
+    # E2 → F downward arrow
+    start = fig_inv.transform(axE2.transAxes.transform((0.5, -0.1)))
+    end   = fig_inv.transform(axF.transAxes.transform((0.85, 1.05)))
+    ann_ax.annotate(
+        "IFFT",
+        xy=end, xytext=start,
+        xycoords='figure fraction', textcoords='figure fraction',
+        arrowprops=dict(arrowstyle="->", lw=1.5),
+        va="center", ha="center"
+    )
+
+    # Title + subtitle
+    fig.suptitle(title, y=0.995, fontsize=14, fontweight="bold")
+    fig.text(0.008, 0.985,
+             "Reference arrivals set phase/timing (geometry); Δ-absorption shifts amplitude per frequency.\n"
+             "Convolving the resulting impulse response with the source yields a realistic received waveform.",
+             ha="left", va="top", fontsize=9)
+
+    if save_path:
+        fig.savefig(save_path, bbox_inches="tight", dpi=200)
+
+    artifacts = dict(S_native=S_native, S_on_grid=S_on_grid, Hf=Hf,
+                     Rspec=Rspec, received=received, p2p_db=float(p2p_db))
+    return fig, artifacts
