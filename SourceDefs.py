@@ -166,11 +166,12 @@ if __name__ == "__main__":
     
     # x_onaxis: your on-axis click (NumPy array), fs in Hz
     y_off, meta = simulate_sperm_click_offaxis(
-        click_waveform, fs=50000,
-        az_deg=25, el_deg=0,         # 25° to the right, level with the rostrum
+        click_waveform, fs=samplerate,
+        az_deg=180, el_deg=0,         # 25° to the right, level with the rostrum
         depth_m=0,                 # optional, nudges LF resonance (≤~520 m effect strongest)
         lf_depth_tune=True
     )
 
     
-    plt.plot(tt, click_waveform, tt, y_off)
+    plt.plot(tt, click_waveform,label= 'on-axis')
+    plt.plot(tt, y_off,label= '180 deg off axis')
