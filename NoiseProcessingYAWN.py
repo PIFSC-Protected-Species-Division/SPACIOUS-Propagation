@@ -31,6 +31,8 @@ import scipy.signal as sps
 import matplotlib.pyplot as plt
 import seaborn as sns
 import matplotlib.ticker as ticker
+import time as time_mod
+
 
 # Optional GCS support
 try:
@@ -151,7 +153,8 @@ DATE_FORMATS = {
     r"\d{8}T\d{6}": "%Y%m%dT%H%M%S",          # 20230101T123456
     r"\d{9}\.\d{12}": "%Y%m%d%H%M%S%f",       # 123456789.20230101234567
     r"\d{4}\.\d{12}": "%Y%m%d%H%M%S%f",       # 2023.20230101234567
-    r"\d{6}-\d{6}\.\d{3}": "%y%m%d-%H%M%S.%f" # 220408-160025.415 (glider-like)
+    r"\d{6}-\d{6}\.\d{3}": "%y%m%d-%H%M%S.%f", # 220408-160025.415 (glider-like)
+    r"\d{6}_\d{6}": "%y%m%d_%H%M%S" # Other glider WISPR_230504_194843.wav
 }
 
 
@@ -427,6 +430,8 @@ class NoiseApp:
         blob.download_to_filename(local)
         return local
 
+
+
     # ------------------------
     # Date parsing utilities
     # ------------------------
@@ -544,6 +549,36 @@ class NoiseApp:
                 yield yb, start
                 start += frames
 
+    def _safe_unlink(self, path: str, retries: int = 6, delay: float = 0.3) -> None:
+        """
+        Best-effort delete for temp files on Windows where libsndfile/h5py/etc
+        can leave brief locks. Retries, loosens perms, and falls back to rename+delete.
+        """
+        if not path or not os.path.exists(path):
+            return
+        for _ in range(retries):
+            try:
+                os.remove(path)
+                return
+            except PermissionError:
+                # Encourage GC to close any lingering file handles
+                gc.collect()
+                try:
+                    os.chmod(path, 0o666)
+                except Exception:
+                    pass
+                time_mod.sleep(delay)
+            except FileNotFoundError:
+                return
+        # Last resort: rename then delete
+        try:
+            tmp = path + ".del"
+            os.replace(path, tmp)
+            os.remove(tmp)
+        except Exception:
+            # Give up quietly; the outer TemporaryDirectory will try again later.
+            pass
+
     # ------------------------
     # One-time preparation
     # ------------------------
@@ -566,7 +601,8 @@ class NoiseApp:
             self.fs = int(info.samplerate)
 
         # FFT grid and overlap
-        self.N = min(self.fs, 2**15)
+        #self.N = min(self.fs, 2**15)
+        self.N = self.fs
         self.overlap = int(np.ceil(self.N * self.r))
         self.step = self.N - self.overlap
 
@@ -862,18 +898,13 @@ class NoiseApp:
         - Downloads each file to a temp folder (if GCS)
         - Streams blocks to compute PSD → metrics → HDF5 appends
         - Rotates HDF5 per UTC day, keeping memory usage bounded
-
-        Parameters
-        ----------
-        start_date : str | datetime.date | None
-            Skip files earlier than this date. If str, use 'YYYY-MM-DD'.
         """
         # Prep once
         self.prep_audio()
         assert self.audiofiles is not None
         assert self.f is not None and self.fs is not None and self.N is not None
         window = np.hanning(self.N).astype(np.float32)
-
+    
         # Parse the filter date if any
         start_dt_date: Optional[date] = None
         if start_date is not None:
@@ -883,173 +914,171 @@ class NoiseApp:
                 start_dt_date = start_date
             else:
                 raise ValueError("start_date must be 'YYYY-MM-DD' or datetime.date")
-
-        current_date_key: Optional[str] = None  # YYYYMMDD string per current file's day
+    
+        current_date_key: Optional[str] = None  # YYYYMMDD
         data_start = 0                           # row cursor within current day's HDF5
-
-        # Create a temp root for this run; it is auto-deleted on success/exception.
+    
+        # Create a temp root for this run; auto-removed on exit
         with tempfile.TemporaryDirectory(prefix="noiseapp_", dir=self.tmp_root) as tmproot:
             print("Temp dir:", tmproot)
-
+    
             for inp in self.audiofiles:
-                # Date filter (based on filename if possible)
+                # Date filter (based on filename if possible) BEFORE download
                 file_date_guess, _ = self._date_key_from_name(inp)
                 if start_dt_date and file_date_guess and (file_date_guess < start_dt_date):
-                    # Skip early files quickly without downloading them
                     continue
-
-                # Download if needed (GCS → local)
-                local_path = self._download_to_temp(inp, tmproot)
-
-                # Determine UTC date for rotation from the local filename (fallback: mtime)
-                file_date, file_ts_dt = self._date_key_from_name(local_path)
-                date_key = file_date.strftime("%Y%m%d") if file_date else "unknown"
-
-                # Switch to a new HDF5 when the day flips
-                if date_key != current_date_key:
-                    current_date_key = date_key
-                    projName = f"{self.ProjName}_{date_key}.h5"
-                    self.fullPath = os.path.join(self.DatabaseLoc, projName)
-                    self.initilize_HDF5(self.fullPath, projName)
-                    data_start = 0
-                    # Reset metric caches to force headers to be written once/day
-                    self.decPrms = None
-                    self.TolPrms = None
-                    self.HbrdMlDec = None
-
-                print(os.path.basename(local_path))
-
-                all_t: List[np.ndarray] = []
-                all_psd: List[np.ndarray] = []
-
-                # Stream ~30-s blocks (memory-capped)
-                for yb, start_samp in self._read_blocks_from_file(
-                    local_path, block_sec=30.0, max_block_bytes=32 * 1024**2
-                ):
-                    # Optional clip at file start
-                    extra_offset = 0.0
-                    if self.clipFileSec and start_samp == 0:
-                        clip_frames = int(self.clipFileSec * self.fs)
-                        if clip_frames < len(yb):
-                            yb = yb[clip_frames:]
-                            extra_offset = self.clipFileSec
-                        else:
-                            # File is shorter than clip; skip this block
-                            continue
-
-                    if self.rmDC:
-                        yb = yb - np.mean(yb)
-
-                    if len(yb) < self.N:
-                        # Need at least one full window
+    
+                local_path: Optional[str] = None
+                try:
+                    # Download if needed (GCS → local)
+                    local_path = self._download_to_temp(inp, tmproot)
+    
+                    # Determine UTC date for rotation from the local filename (fallback: mtime)
+                    file_date, file_ts_dt = self._date_key_from_name(local_path)
+                    date_key = file_date.strftime("%Y%m%d") if file_date else "unknown"
+    
+                    # Switch to a new HDF5 when the day flips
+                    if date_key != current_date_key:
+                        current_date_key = date_key
+                        projName = f"{self.ProjName}_{date_key}.h5"
+                        self.fullPath = os.path.join(self.DatabaseLoc, projName)
+                        self.initilize_HDF5(self.fullPath, projName)
+                        data_start = 0
+                        # Reset metric caches to force headers to be written once/day
+                        self.decPrms = None
+                        self.TolPrms = None
+                        self.HbrdMlDec = None
+    
+                    print(os.path.basename(local_path))
+    
+                    all_t: List[np.ndarray] = []
+                    all_psd: List[np.ndarray] = []
+    
+                    # Stream ~30-s blocks (memory-capped)
+                    for yb, start_samp in self._read_blocks_from_file(
+                        local_path, block_sec=30.0, max_block_bytes=32 * 1024**2
+                    ):
+                        # Optional clip at file start
+                        extra_offset = 0.0
+                        if self.clipFileSec and start_samp == 0:
+                            clip_frames = int(self.clipFileSec * self.fs)
+                            if clip_frames < len(yb):
+                                yb = yb[clip_frames:]
+                                extra_offset = self.clipFileSec
+                            else:
+                                continue  # file shorter than clip
+    
+                        if self.rmDC:
+                            yb = yb - np.mean(yb)
+    
+                        if len(yb) < self.N:
+                            continue  # need at least one full window
+    
+                        # PSD (density)
+                        f_bins, t_rel, Sxx = sps.spectrogram(
+                            yb,
+                            fs=self.fs,
+                            window=window,
+                            nperseg=self.N,
+                            noverlap=self.overlap,
+                            nfft=self.N,
+                            detrend=False,
+                            scaling="density",
+                            mode="psd",
+                        )
+    
+                        t_abs = t_rel + (start_samp / self.fs) + extra_offset
+    
+                        # Sync sensitivity grid if FFT grid changed
+                        if len(self.f) != len(f_bins) or (not np.allclose(self.f, f_bins)):
+                            self.f = f_bins.copy()
+                            self.M_uPa = self._build_M_uPa()
+    
+                        # V²/Hz -> µPa²/Hz
+                        newPss_V2Hz = Sxx.T.astype(np.float32, copy=False)
+                        M = self.M_uPa[None, :].astype(np.float32, copy=False)
+                        newPss_cal = newPss_V2Hz / (M ** 2)
+    
+                        all_t.append(t_abs.astype(np.float32))
+                        all_psd.append(newPss_cal.astype(np.float32))
+    
+                    # If no data for this file, just move on
+                    if not all_t:
+                        del all_t, all_psd
+                        gc.collect()
                         continue
-
-                    # PSD (density) using scipy.signal.spectrogram
-                    f_bins, t_rel, Sxx = sps.spectrogram(
-                        yb,
-                        fs=self.fs,
-                        window=window,
-                        nperseg=self.N,
-                        noverlap=self.overlap,
-                        nfft=self.N,
-                        detrend=False,
-                        scaling="density",
-                        mode="psd",
-                    )
-
-                    # Absolute seconds from file start (float seconds)
-                    t_abs = t_rel + (start_samp / self.fs) + extra_offset
-
-                    # If for some reason FFT grid changes, sync sensitivity grid
-                    if len(self.f) != len(f_bins) or (not np.allclose(self.f, f_bins)):
-                        self.f = f_bins.copy()
-                        self.M_uPa = self._build_M_uPa()
-
-                    # V²/Hz -> µPa²/Hz using sensitivity M (V/µPa)
-                    newPss_V2Hz = Sxx.T.astype(np.float32, copy=False)  # (T, F)
-                    M = self.M_uPa[None, :].astype(np.float32, copy=False)
-                    newPss_cal = newPss_V2Hz / (M ** 2)
-
-                    all_t.append(t_abs.astype(np.float32))
-                    all_psd.append(newPss_cal.astype(np.float32))
-
-                # If no data accumulated for this file, continue
-                if not all_t:
-                    # Free any residuals just in case
+    
+                    # Concatenate to a single time/PSD array
+                    Tsec = np.concatenate(all_t)      # (Ncols,)
+                    PSD = np.vstack(all_psd)          # (Ncols, F)
                     del all_t, all_psd
                     gc.collect()
-                    continue
-
-                # Concatenate into a single time/PSD array
-                Tsec = np.concatenate(all_t)      # (Ncols,)
-                PSD = np.vstack(all_psd)          # (Ncols, F)
-                del all_t, all_psd                # free immediately
-                gc.collect()
-
-                # Bin to aveSec by grouping columns into time bins
-                delf = (self.f[1] - self.f[0]) if len(self.f) > 1 else (self.fs / self.N)
-                t0_sec = float(Tsec.min())
-                t_anchor = t0_sec - (t0_sec % self.aveSec)
-                bin_idx = ((Tsec - t_anchor) // self.aveSec).astype(np.int64)
-
-                uniq = np.unique(bin_idx)
-                PSD_bin = np.zeros((len(uniq), PSD.shape[1]), dtype=np.float32)
-                dt_bins: List[datetime] = []
-
-                for j, b in enumerate(uniq):
-                    m = (bin_idx == b)
-                    PSD_bin[j, :] = np.nanmean(PSD[m, :], axis=0, dtype=np.float64)  # stable mean
-                    tc = (int(b) + 0.5) * self.aveSec + t_anchor
-                    if file_ts_dt is None:
-                        dt_bins.append(datetime.utcfromtimestamp(0) + timedelta(seconds=float(tc)))
+    
+                    # Bin to aveSec by grouping columns into time bins
+                    delf = (self.f[1] - self.f[0]) if len(self.f) > 1 else (self.fs / self.N)
+                    t0_sec = float(Tsec.min())
+                    t_anchor = t0_sec - (t0_sec % self.aveSec)
+                    bin_idx = ((Tsec - t_anchor) // self.aveSec).astype(np.int64)
+    
+                    uniq = np.unique(bin_idx)
+                    PSD_bin = np.zeros((len(uniq), PSD.shape[1]), dtype=np.float32)
+                    dt_bins: List[datetime] = []
+    
+                    for j, b in enumerate(uniq):
+                        m = (bin_idx == b)
+                        PSD_bin[j, :] = np.nanmean(PSD[m, :], axis=0, dtype=np.float64)
+                        tc = (int(b) + 0.5) * self.aveSec + t_anchor
+                        if file_ts_dt is None:
+                            dt_bins.append(datetime.utcfromtimestamp(0) + timedelta(seconds=float(tc)))
+                        else:
+                            day_start = datetime.combine(file_ts_dt.date(), time())
+                            dt_bins.append(day_start + timedelta(seconds=float(tc)))
+                    del PSD
+                    gc.collect()
+    
+                    # Metrics
+                    apsd_60 = 10.0 * np.log10(np.maximum(PSD_bin, 1e-30) / (self.pref ** 2)).astype(np.float32)
+                    milidec = self.calcHybridMilidecades(apsd_60).astype(np.float32)
+                    Broadband = self.calcBroadband(PSD_bin, float(delf)).astype(np.float32)
+                    TOL = self.calc13Octave(PSD_bin, B=1.0).astype(np.float32)
+                    decadeBands = self.calcDecadeband(PSD_bin).astype(np.float32)
+    
+                    # Serialize timestamps
+                    if self.time_storage == "epoch":
+                        dt_vals = np.array([dt.timestamp() for dt in dt_bins], dtype="float64")
+                        self.writeDatatoHDF5(dt_vals, "DateTime", data_start=data_start, storage_mode="float64")
                     else:
-                        # Attach to the file's date; keep time-of-day relative within that date
-                        day_start = datetime.combine(file_ts_dt.date(), time())
-                        dt_bins.append(day_start + timedelta(seconds=float(tc)))
-                del PSD
-                gc.collect()
-
-                # Metrics
-                apsd_60 = 10.0 * np.log10(np.maximum(PSD_bin, 1e-30) / (self.pref ** 2)).astype(np.float32)
-                milidec = self.calcHybridMilidecades(apsd_60).astype(np.float32)
-                Broadband = self.calcBroadband(PSD_bin, float(delf)).astype(np.float32)
-                TOL = self.calc13Octave(PSD_bin, B=1.0).astype(np.float32)
-                decadeBands = self.calcDecadeband(PSD_bin).astype(np.float32)
-
-                # Serialize timestamps
-                if self.time_storage == "epoch":
-                    # seconds since UNIX epoch (float64 for precision)
-                    dt_vals = np.array([dt.timestamp() for dt in dt_bins], dtype="float64")
-                    self.writeDatatoHDF5(dt_vals, "DateTime", data_start=data_start, storage_mode="float64")
-                else:
-                    # ISO strings for plotting convenience
-                    ttISO = np.array([dt.strftime("%Y%m%dT%H%M%S") for dt in dt_bins])
-                    self.writeDatatoHDF5(ttISO, "DateTime", data_start=data_start, storage_mode="str")
-
-                # Data arrays
-                self.writeDatatoHDF5(milidec, "hybridMiliDecLevels", data_start=data_start, storage_mode="float32")
-                self.writeDatatoHDF5(Broadband, "broadband", data_start=data_start, storage_mode="float32")
-                self.writeDatatoHDF5(TOL, "thirdoct", data_start=data_start, storage_mode="float32")
-                self.writeDatatoHDF5(decadeBands, "decadeLevels", data_start=data_start, storage_mode="float32")
-
-                # Write headers on first chunk of the day
-                if data_start == 0:
-                    self.writeDatatoHDF5(self.HbrdMlDec["freqLims"], "hybridDecFreqHz",
-                                         data_start=0, max_rows=len(self.HbrdMlDec["freqLims"]), storage_mode="float32")
-                    self.writeDatatoHDF5(self.TolPrms["fc"], "thirdOctFreqHz",
-                                         data_start=0, max_rows=len(self.TolPrms["fc"]), storage_mode="float32")
-                    self.writeDatatoHDF5(self.decPrms["decade_edges"], "decadeFreqHz",
-                                         data_start=0, max_rows=len(self.decPrms["decade_edges"]), storage_mode="float32")
-
-                # Advance the row cursor
-                data_start += len(dt_bins)
-
-                # Aggressive cleanup for long runs
-                del PSD_bin, apsd_60, milidec, Broadband, TOL, decadeBands, dt_bins
-                gc.collect()
-
-        # When we exit the with-block, the temp directory is removed.
-        # All HDF5 files are closed after each append (open/close per write).
+                        ttISO = np.array([dt.strftime("%Y%m%dT%H%M%S") for dt in dt_bins])
+                        self.writeDatatoHDF5(ttISO, "DateTime", data_start=data_start, storage_mode="str")
+    
+                    # Data arrays
+                    self.writeDatatoHDF5(milidec, "hybridMiliDecLevels", data_start=data_start, storage_mode="float32")
+                    self.writeDatatoHDF5(Broadband, "broadband", data_start=data_start, storage_mode="float32")
+                    self.writeDatatoHDF5(TOL, "thirdoct", data_start=data_start, storage_mode="float32")
+                    self.writeDatatoHDF5(decadeBands, "decadeLevels", data_start=data_start, storage_mode="float32")
+    
+                    # Write headers on first chunk of the day
+                    if data_start == 0:
+                        self.writeDatatoHDF5(self.HbrdMlDec["freqLims"], "hybridDecFreqHz",
+                                             data_start=0, max_rows=len(self.HbrdMlDec["freqLims"]), storage_mode="float32")
+                        self.writeDatatoHDF5(self.TolPrms["fc"], "thirdOctFreqHz",
+                                             data_start=0, max_rows=len(self.TolPrms["fc"]), storage_mode="float32")
+                        self.writeDatatoHDF5(self.decPrms["decade_edges"], "decadeFreqHz",
+                                             data_start=0, max_rows=len(self.decPrms["decade_edges"]), storage_mode="float32")
+    
+                    # Advance row cursor
+                    data_start += len(dt_bins)
+    
+                    # Cleanup
+                    del PSD_bin, apsd_60, milidec, Broadband, TOL, decadeBands, dt_bins
+                    gc.collect()
+    
+                finally:
+                    # Explicitly delete the downloaded file if source was GCS.
+                    if local_path and self._is_gcs_path(inp) and os.path.exists(local_path):
+                        self._safe_unlink(local_path)
+    
+        # Exiting the with-block removes the (now empty) tmproot.
         return
 
     # ------------------------
@@ -1296,37 +1325,43 @@ def plot_ltsa(instrument_group, averaging_period="5min", titleText=""):
     plt.show()
     return fig
 
-
+#%%
 # ---------------------------------------------------------------------------
 # Example usage
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
     # GCS source (bucket/prefix)
-    gsCloudLoc = "gs://pifsc-1/glider/sg680_MHI_Apr2022/recordings/wav"
-    out_dir = r"C:\Users\pam_user\Documents\HybridMilliDaily"
-    calib_csv = r"C:\Users\pam_user\Downloads\sg680_CalCurCEAS_Sep2024_sensitivity_2025-07-29.csv"
+    gsCloudLoc = "gs://pifsc-1/glider/sg679_MHI_May2023/recordings/wav"
+    out_dir = r"X:\\Kaitlin_Palmer\\MHI_679_Noise"
+    calib_csv = r"C:\\Users\\pam_user\\Downloads\\sg679_MHI_May2023_sensitivity_2025-06-20.csv"
 
     app = NoiseApp(
         Si=calib_csv,
-        soundFilePath=gsCloudLoc,
-        ProjName="sg680_MHI_Apr2022",
-        DepName="SG650",
+        soundFilePath = gsCloudLoc,
+        ProjName="sg679_MHI_May2023",
+        DepName="MHI_679",
+        aveSec=60,
         DatabaseLoc=out_dir,
-        rmDC=True,
+        rmDC=False,
         Si_units="V/µPa",
         time_storage="str",   # 'epoch' for faster writes
         tmp_root=out_dir,     # keep temp folders on the same drive as outputs
         gcs_chunk_mb=16,      # tune for your network
         tmp_max_gb=0.0,       # set >0 to enforce per-file temp size guard
+        r =.5
+        
     )
 
-    # Start at a specific date (skip earlier files)
-    app.run_analysis(start_date="2022-04-08")
 
+    # Start at a specific date (skip earlier files)
+    app.run_analysis("2023-05-25")
+
+#%%
     # Example to plot later:
-    h5_name = r"C:\Users\pam_user\Documents\HybridMilliDaily\sg680_MHI_Apr2022_20220408.h5"
+    h5_name = r"C:\Users\pam_user\Documents\HybridMilliDaily\sg679_MHI_May2023_20250502.h5"
+    
     with h5py.File(h5_name, "r") as hdf:
-        grp = hdf["SG650"]
+        grp = hdf["MHI_679"]
         _ = plot_milidecade_statistics(grp)
         _ = plot_ltsa(grp, averaging_period="60min", titleText="Apr 8")
