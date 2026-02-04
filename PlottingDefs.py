@@ -352,10 +352,19 @@ def process_run(run_id: str,
         if len(data.get("rx_depth_ndx", [])) == 0:
             return run_index, []
 
-        # Pre-build frequency grid if needed
+        # # Pre-build frequency grid if needed
+        # if coherent:
+        #     fmax_hz = min(fmax_hz, 0.49 * fs)  # Nyquist safety
+        #     freqs = _build_freq_grid(fmin_hz=fmin_hz, fmax_hz=fmax_hz, df_hz=df_hz)
+            
         if coherent:
-            fmax_hz = min(fmax_hz, 0.49 * fs)  # Nyquist safety
+            fmax_hz = min(fmax_hz, 0.49 * fs)
             freqs = _build_freq_grid(fmin_hz=fmin_hz, fmax_hz=fmax_hz, df_hz=df_hz)
+        
+            # PRECOMPUTE SOURCE ON GRID ONCE PER RUN
+            tau_all = np.asarray(data["time_of_arrival"], float).ravel()
+            S_f, n_time = _precompute_source_on_grid(segment, fs, freqs, tau_all)
+
 
         # Evaluate only for valid depth indices in this row
         depth_idxs = np.where(depth_row > 0)[0]
@@ -367,18 +376,28 @@ def process_run(run_id: str,
 
             hyd = {k: (v[mask] if k in data else None) for k, v in data.items()}
 
+            # if coherent:
+            #     val_db, _ = p2pArrivalSNR_coherent(
+            #         hyd, segment, fs,
+            #         freqs_hz=freqs,
+            #         alpha_model="thorp",
+            #         c_eff_m_s=c_eff_m_s,
+            #         f_ref_hz=f_ref_hz,
+            #         arrivals_include_absorption=arrivals_include_absorption
+            #     )
+            # else:
+            #     val_db, _ = p2pArrivalSNR(hyd, segment, fs)
+            
             if coherent:
-                val_db, _ = p2pArrivalSNR_coherent(
-                    hyd, segment, fs,
-                    freqs_hz=freqs,
-                    alpha_model="thorp",
-                    c_eff_m_s=c_eff_m_s,
-                    f_ref_hz=f_ref_hz,
+                val_db = p2pArrivalSNR_coherent_fast(
+                    hyd, S_f=S_f, fs=fs, freqs_hz=freqs, n_time=n_time,
+                    c_eff_m_s=c_eff_m_s, f_ref_hz=f_ref_hz,
                     arrivals_include_absorption=arrivals_include_absorption
                 )
             else:
                 val_db, _ = p2pArrivalSNR(hyd, segment, fs)
-
+                    
+            
             results.append((d_idx, val_db))
 
     return run_index, results
@@ -657,14 +676,14 @@ def CreateOutputCSVs_long(h5_path: str,
                 for depth_idx, val in pairs:
                     p2p_grid[run_index, depth_idx] = val
 
-        # -----------------------------------------
-        # ORIGINAL grid dump (keep if you still want it)
-        # -----------------------------------------
-        grid_name = (f"PeakToPeak_{dive_id}_GliderDepth_{int(round(drifter_depth))}m_"
-                     f"{int(fmin_hz/1000)}_{int(fmax_hz/1000)}khz.csv")
-        grid_file = os.path.join(out_path, grid_name)
-        np.savetxt(_ensure_parent_dir(grid_file), p2p_grid, delimiter=",")
-        print(f"Saved grid CSV: {grid_file}")
+        # # -----------------------------------------
+        # # ORIGINAL grid dump (keep if you still want it)
+        # # -----------------------------------------
+        # grid_name = (f"PeakToPeak_{dive_id}_GliderDepth_{int(round(drifter_depth))}m_"
+        #              f"{int(fmin_hz/1000)}_{int(fmax_hz/1000)}khz.csv")
+        # grid_file = os.path.join(out_path, grid_name)
+        # np.savetxt(_ensure_parent_dir(grid_file), p2p_grid, delimiter=",")
+        # print(f"Saved grid CSV: {grid_file}")
 
         # -----------------------------------------
         # NEW: LONG, VECTORIZED export (location × depth)
@@ -711,6 +730,54 @@ def CreateOutputCSVs_long(h5_path: str,
         long_file = os.path.join(out_path, long_name)
         df_out.to_csv(_ensure_parent_dir(long_file), index=False)
         print(f"Saved long CSV: {long_file}  ({len(df_out):,} rows)")
+
+
+def p2pArrivalSNR_coherent_fast(arrivals: dict,
+                                S_f: np.ndarray,
+                                fs: int,
+                                freqs_hz: np.ndarray,
+                                n_time: int,
+                                c_eff_m_s: float,
+                                f_ref_hz: float,
+                                arrivals_include_absorption: bool = True):
+    tau = np.asarray(arrivals.get("time_of_arrival", []), float).reshape(-1)
+    amp = np.asarray(arrivals.get("arrival_amplitude", []), complex).reshape(-1)
+    if tau.size == 0 or amp.size == 0:
+        return np.nan
+
+    # Path length estimate (since you do not store path_length_m)
+    Rm = tau * float(c_eff_m_s)
+
+    # Δα(f) in dB/km (Thorp)
+    alpha_db_per_km = thorp_alpha_db_per_km(freqs_hz)
+    alpha_ref_db_per_km = float(thorp_alpha_db_per_km(np.array([f_ref_hz]))[0])
+
+    if arrivals_include_absorption:
+        delta_db_per_km = alpha_db_per_km - alpha_ref_db_per_km
+    else:
+        delta_db_per_km = alpha_db_per_km
+
+    # convert Δα(f) to Np/m
+    delta_np_per_m = (delta_db_per_km / 20.0) * np.log(10.0) / 1000.0  # shape (K,)
+
+    # ---- vectorized coherent sum over arrivals ----
+    # weights per-arrival per-frequency: exp(-Δα(f)*R_i)
+    # shape: (M,K) = (M,1) * (1,K)
+    w = np.exp(-Rm[:, None] * delta_np_per_m[None, :]) * amp[:, None]   # complex (M,K)
+
+    # phase term exp(-j2π f τ_i) shape (M,K)
+    phase = np.exp(-1j * 2.0*np.pi * tau[:, None] * freqs_hz[None, :])
+
+    H_f = np.sum(w * phase, axis=0)   # shape (K,)
+
+    # received spectrum on synthesis grid
+    Rspec = S_f * H_f
+
+    # back to time: interpolate onto rFFT grid then irfft
+    received = _safe_irfft_on_grid(freqs_hz, Rspec, n_time=n_time, fs=fs)
+
+    p2p_db = 20.0 * np.log10(np.ptp(np.real(received)) + 1e-18)
+    return float(np.round(p2p_db, 1))
 
 # =============================================================================
 # Frequency-dependent absorption (thermodynamic models)
@@ -801,6 +868,23 @@ def apply_alpha_correction(h5_path: str, RLdata: np.ndarray, alpha_db_per_km: fl
             slant_km = np.hypot(horiz_km, vertical_km)
             corrected[i, j] = val + alpha_db_per_km * slant_km
     return corrected
+
+def _precompute_source_on_grid(segment: np.ndarray, fs: int, freqs_hz: np.ndarray, tau_all: np.ndarray):
+    tau_all = np.asarray(tau_all, float).reshape(-1)
+    delay_span = float(np.max(tau_all) - np.min(tau_all)) if tau_all.size else 0.0
+
+    n_signal = len(segment)
+    n_extra  = int(np.ceil(delay_span * fs)) + 1
+    n_time   = 1 << int(np.ceil(np.log2(n_signal + n_extra)))  # next pow2
+
+    S_rfft = np.fft.rfft(segment, n=n_time)
+    f_rfft = np.fft.rfftfreq(n_time, d=1.0/fs)
+
+    # complex interp onto synthesis grid
+    S_f = (np.interp(freqs_hz, f_rfft, np.real(S_rfft), left=0.0, right=0.0)
+         + 1j*np.interp(freqs_hz, f_rfft, np.imag(S_rfft), left=0.0, right=0.0))
+    return S_f, n_time
+
 
 # =============================================================================
 # Plotting

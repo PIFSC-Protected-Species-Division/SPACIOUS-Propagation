@@ -23,7 +23,7 @@ import matplotlib.pyplot as plt
 # File locations for the HDF5 from the bellhop models, audio file to convolve
 # and where to save th exported csvs
 h5_path = 'X:\Kaitlin_Palmer\\CalCurCEAS_propagation_hdf5s\\BottomSenExperiment\\Spacious_CalCurses_Sensitivity_PCHIP_12kHz_20km_200m_BotSensitivity.h5'
-wav_path = "C:\\Users\\pam_user\\Documents\\GitHub\\SPACIOUS-Propagation-Modes\\ExampleData\\1705_20171028_010934_441.wav"
+wav_path = "C:\\Users\\pam_user\\Documents\\GitHub\\SPACIOUS-Propagation-Modes\\ExampleData\\WHICEAS_click.wav"
 out_path = "X:\Kaitlin_Palmer\CalCurCEAS_propagation_csvs\BottomSenExperiment"
 
 # h5_path = 'C:\\Users\\kaity\\Documents\\GitHub\\SPACIOUS-Propagation-Modes\\Spacious_Hawaii_diveDepth_ArrArray_PCHIP_35khz_20km - Copy.h5'
@@ -32,25 +32,25 @@ out_path = "X:\Kaitlin_Palmer\CalCurCEAS_propagation_csvs\BottomSenExperiment"
 
 # --- Signal Setup ---
 #samplerate, audiodata = wavfile.read(wav_path)
-audiodata, samplerate = librosa.load(wav_path, sr=65000,    mono= False)
-t_start, t_end, chan = 32.58, 32.60, 4
-segment = audiodata[chan, int(round(t_start * samplerate)):int(round(t_end * samplerate))]
-tt = np.linspace(0, len(segment)/samplerate, len(segment))
+audiodata, samplerate = librosa.load(wav_path, sr=60000,    mono= False)
+#t_start, t_end, chan = 32.58, 32.60, 4
+#segment = audiodata[chan, int(round(t_start * samplerate)):int(round(t_end * samplerate))]
+tt = np.linspace(0, len(audiodata)/samplerate, len(audiodata))
 # Adjust figure size and DPI if needed
 plt.figure(figsize=(11, 5), dpi=100)
 
 # Plot raw click for a giggle test
 plt.figure(1)
-plt.plot(tt*1000, segment)
+plt.plot(tt*1000, audiodata)
 plt.xlabel('Time (ms)', fontsize=12)
 plt.ylabel('Amplitude', fontsize=12)
 plt.title('Raw Sperm Whale Click', fontsize=14)
 
 # Scale the segment using the custom function so it's 220 dB 
 # peak-to-peak prior to convolution with the impulse response
-click_waveform = scaleP2P(segment, outP2P= 220)
+click_waveform = scaleP2P(audiodata, outP2P= 220)
 
-plt.plot(tt*1000, segment)
+plt.plot(tt*1000, click_waveform)
 
 
 #%% Use convolution of the signal of interest to calculate the peak to peak
@@ -97,13 +97,13 @@ for h5file in result:
         segment=click_waveform,         # 1-D np.ndarray
         samplerate=samplerate,
         out_path=str(out_path),
-        coherent=False,
-        nWorkers=60,
+        coherent=True,
+        nWorkers=25,
         f_ref_hz=12000,
         prefer_processes=False,         # threads are safer on Windows top-level
-        fmin_hz=1000, 
-        fmax_hz=20000, 
-        df_hz=200
+        fmin_hz=100, 
+        fmax_hz=samplerate/2, 
+        df_hz=100
     )
 
     print(f"{h5file} -> {out_path}")
