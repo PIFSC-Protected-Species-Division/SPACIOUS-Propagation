@@ -7,7 +7,8 @@ Created on Sat Aug  9 04:07:27 2025
 This is to be used with PlottingDefs.py this should be an example, plottingDefs
 should be the begining of a package
 """
-
+import sys
+sys.path.append(r"C:\Users\pam_user\Documents\GitHub\SPACIOUS-Propagation")
 from scipy.io import wavfile
 import os
 #from PlottingDefs import CreateOutputCSVs, CreateOutputCSVs_Spherical, export_long_tables_spherical
@@ -18,6 +19,9 @@ from PlottingDefs import CreateOutputCSVs_long
 import librosa
 import numpy as np
 import matplotlib.pyplot as plt
+
+
+
 
 #%% Create the CSV's of the arrival RLs
 # File locations for the HDF5 from the bellhop models, audio file to convolve
@@ -70,6 +74,8 @@ print(result)
 base_in  = Path(r"X:\Kaitlin_Palmer\CalCurCEAS_propagation_hdf5s")
 base_out = Path(r"X:\Kaitlin_Palmer\BotSensitivityCSVs")
 
+
+
 for h5file in result:
     # Full path to input HDF5
     hfLoc = base_in / h5file
@@ -81,7 +87,7 @@ for h5file in result:
     elif "silt" in name_lower:
         subdir = "silt"
     else:
-        subdir = ""  # keep base_out; or use "other" if you prefer a catch-all
+        subdir = "basalt"  # keep base_out; or use "other" if you prefer a catch-all
 
     # Build output path and ensure it exists
     out_path = (base_out / subdir) if subdir else base_out
@@ -98,7 +104,7 @@ for h5file in result:
         samplerate=samplerate,
         out_path=str(out_path),
         coherent=True,
-        nWorkers=25,
+        nWorkers=15,
         f_ref_hz=12000,
         prefer_processes=False,         # threads are safer on Windows top-level
         fmin_hz=100, 
@@ -110,10 +116,67 @@ for h5file in result:
 
 
 # Export the metadata for each gird
+#%% Same thing as above but parallelized on the outer loop
 
+# from concurrent.futures import ProcessPoolExecutor, as_completed
+# import multiprocessing as mp
 
+# from pathlib import Path
 
-#%% Should we model Pdet as a function of RL?
+# def process_h5file(h5file, base_in, base_out, click_waveform, samplerate):
+#     hfLoc = base_in / h5file
+    
+#     print("Starting worker:", h5file)
+
+#     name_lower = h5file.lower()
+#     if "gravel" in name_lower:
+#         subdir = "gravel"
+#     elif "silt" in name_lower:
+#         subdir = "silt"
+#     else:
+#         subdir = "basalt"
+
+#     out_path = (base_out / subdir) if subdir else base_out
+#     out_path.mkdir(parents=True, exist_ok=True)
+
+#     CreateOutputCSVs_long(
+#         h5_path=str(hfLoc),
+#         segment=click_waveform,
+#         samplerate=samplerate,
+#         out_path=str(out_path),
+#         coherent=True,
+#         nWorkers=1,                  # 🔴 critical change
+#         f_ref_hz=12000,
+#         prefer_processes=False,
+#         fmin_hz=100,
+#         fmax_hz=samplerate/2,
+#         df_hz=100
+#     )
+
+#     return f"{h5file} -> {out_path}"
+
+# if __name__ == "__main__":
+#     base_in  = Path(r"X:\Kaitlin_Palmer\CalCurCEAS_propagation_hdf5s")
+#     base_out = Path(r"X:\Kaitlin_Palmer\BotSensitivityCSVs")
+
+#     n_cores = mp.cpu_count()
+#     n_jobs = min(12, n_cores - 1)
+#     with ProcessPoolExecutor(max_workers=n_jobs) as executor:
+#         futures = [
+#             executor.submit(
+#                 process_h5file,
+#                 h5file,
+#                 base_in,
+#                 base_out,
+#                 click_waveform,
+#                 samplerate
+#             )
+#             for h5file in result
+#         ]
+
+#         for f in as_completed(futures):
+#             print(f.result())
+# #%% Should we model Pdet as a function of RL?
 
 # detThreshs = [130,135,140]
 

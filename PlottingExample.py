@@ -10,33 +10,43 @@ should be the begining of a package
 
 from scipy.io import wavfile
 import os
-from PlottingDefs import CreateOutputCSVs
-from PlottingDefs import scaleP2P, CreateOutputCSVs, alphaAdjustment
-from PlottingDefs import apply_alpha_correction, plot_peak2peak_isosurfaces, plot_detection_probability
-from PlottingDefs import plot_detection_vs_range, plot_detection_by_bearing
-
-
+#from PlottingDefs import CreateOutputCSVs, CreateOutputCSVs_Spherical, export_long_tables_spherical
+from PlottingDefs import scaleP2P # for source level scaling
+from PlottingDefs import plot_peak2peak_isosurfaces, plot_detection_probability, plot_peak2peak_isosurfaces_long
+from PlottingDefs import plot_detection_vs_range, fig_signal_ir_output, fit_and_plot_hazard_rate_by_location
+from PlottingDefs import CreateOutputCSVs_long, alphaAdjustment, apply_alpha_correction, plot_detection_by_bearing
+import librosa
 import numpy as np
 import matplotlib.pyplot as plt
+
+
+
+
+import matplotlib as mpl
+import matplotlib.pyplot as plt
+
+# Turn off LaTeX text rendering (this is what's failing)
+mpl.rcParams["text.usetex"] = False
+
+# Optional: make sure mathtext is used instead of TeX
+mpl.rcParams["mathtext.default"] = "regular"
 
 #%% Creat the CSV's of the arrival RLs
 # File locations for the HDF5 from the bellhop models, audio file to convolve
 # and where to save th exported csvs
-h5_path = 'C:\\Users\\pam_user\\Documents\\GitHub\\SPACIOUS-Propagation-Modes\\Spacious_CalCurses_Sensitivity_PCHIP_35khz_20km_500m.h5'
-wav_path = "C:\\Users\\pam_user\\Documents\\GitHub\\SPACIOUS-Propagation-Modes\\ExampleData\\LF_1705_20171028_010934_441.wav"
-out_path = "X:\Kaitlin_Palmer\CalCurCEAS_propagation_csvs"
+h5_path = 'X:\Kaitlin_Palmer\\CalCurCEAS_propagation_hdf5s\\BottomSenExperiment\\Spacious_CalCurses_Silt_PCHIP_12kHz_20km_500m_BotSensitivity.h5'
+wav_path = "C:\\Users\\pam_user\\Documents\\GitHub\\SPACIOUS-Propagation-Modes\\ExampleData\\1705_20171028_010934_441.wav"
+out_path = "X:\Kaitlin_Palmer\CalCurCEAS_propagation_csvs\BottomSenExperiment"
 
-h5_path = 'C:\\Users\\kaity\\Documents\\GitHub\\SPACIOUS-Propagation-Modes\\Spacious_Hawaii_diveDepth_ArrArray_PCHIP_35khz_20km - Copy.h5'
-wav_path = "C:\\Users\\kaity\\Documents\\GitHub\\SPACIOUS-Propagation-Modes\\ExampleData\\LF_1705_20171028_010934_441.wav"
-out_path = "C:\\Users\\kaity\\Desktop\\TestCoherentBellhopCSVS"
-
-
-
+# h5_path = 'C:\\Users\\kaity\\Documents\\GitHub\\SPACIOUS-Propagation-Modes\\Spacious_Hawaii_diveDepth_ArrArray_PCHIP_35khz_20km - Copy.h5'
+# wav_path = "C:\\Users\\kaity\\Documents\\GitHub\\SPACIOUS-Propagation-Modes\\ExampleData\\LF_1705_20171028_010934_441.wav"
+# out_path = "C:\\Users\\kaity\\Desktop\\TestCoherentBellhopCSVS"
 
 # --- Signal Setup ---
-samplerate, audiodata = wavfile.read(wav_path)
+#samplerate, audiodata = wavfile.read(wav_path)
+audiodata, samplerate = librosa.load(wav_path, sr=65000,    mono= False)
 t_start, t_end, chan = 32.58, 32.60, 4
-segment = audiodata[int(round(t_start * samplerate)):int(round(t_end * samplerate)), chan]
+segment = audiodata[chan, int(round(t_start * samplerate)):int(round(t_end * samplerate))]
 tt = np.linspace(0, len(segment)/samplerate, len(segment))
 # Adjust figure size and DPI if needed
 plt.figure(figsize=(11, 5), dpi=100)
@@ -54,32 +64,57 @@ click_waveform = scaleP2P(segment, outP2P= 220)
 
 plt.plot(tt*1000, segment)
 
+
 #%% Use convolution of the signal of interest to calculate the peak to peak
 # RL at each of the sensor locations
 
 # Calculate the received arrays and export to csv- this takes a while
 
+import os
+import glob
+
+os.chdir('X:\\Kaitlin_Palmer\\CalCurCEAS_propagation_hdf5s\\')
+result = glob.glob('*.{}'.format('h5'))
+print(result)
+
+for h5file in result:
+    hfLoc = (os.path.join('X:\\Kaitlin_Palmer\\CalCurCEAS_propagation_hdf5s\\',
+                       h5file))
+    
+    # Export metadata
+    fname = os.path.splitext(h5file)[0]
+    out_csv = os.path.join('X:\\Kaitlin_Palmer\\CalCurCEAS_propagation_csvs', 
+                           fname+ '.csv')
+    
+    out_path = 'X:\\Kaitlin_Palmer\\CalCurCEAS_propagation_csvs'
+
+    
+    CreateOutputCSVs_long(
+        h5_path=hfLoc,
+        segment=click_waveform,                 # 1-D np.ndarray
+        samplerate=samplerate,
+        out_path=out_path,
+        coherent=False,
+        nWorkers=60,
+        f_ref_hz =35000,
+        prefer_processes=False,           # threads are safer on Windows top-level
+        fmin_hz=1000, 
+        fmax_hz=20000, 
+        df_hz=200
+    )
+    print(h5file)
 
 
-CreateOutputCSVs(
-    h5_path=h5_path,
-    segment=click_waveform,          # your recorded click
-    samplerate=samplerate,
-    out_path=out_path,
-    coherent=True,                   # enable wideband coherent p2p
-    nWorkers=4,
-    fmin_hz=20000.0,
-    fmax_hz=90000.0,
-    df_hz=200.0,
-    c_eff_m_s=1480.0,
-    f_ref_hz=35000.0,                # your Bellhop run frequency
-    arrivals_include_absorption=True # typical with arlpy/bellhop
-)
-
-
+# Export the metadata for each gird
 
 #%% Load the RL grid in the previous section and make plots 
-RLdata = np.genfromtxt('X:\\Kaitlin_Palmer\\CalCurCEAS_propagation_csvs\\PeakToPeak_dive_42_GliderDepth_500m.csv', delimiter=',')
+
+rLlOC = 'X:\\Kaitlin_Palmer\\CalCurCEAS_propagation_csvs\\PeakToPeak_dive_42_GliderDepth_500m.csv'
+rLlOC = 'X:\\Kaitlin_Palmer\\BotSensitivityCSVs\\silt\\PeakToPeak_dive_167_GliderDepth_500m_1_20khz_long.csv'
+
+RLdata = np.genfromtxt(rLlOC, delimiter=',')
+
+
 np.nanmax(RLdata)
 
 # The impulse response was created using a bellhop model at 35khz and the
@@ -128,60 +163,101 @@ stats_dict = plot_detection_by_bearing(
 
 #%% Should we model Pdet as a function of RL?
 
-detThreshs = [20,40,80]
+
+import pandas as pd
+
+rLlOC = 'X:\\Kaitlin_Palmer\\BotSensitivityCSVs\\silt\\PeakToPeak_dive_167_GliderDepth_500m_1_20khz_long.csv'
+rl_df = pd.read_csv(rLlOC)
+
+
+h5_path = 'X:\\Kaitlin_Palmer\\CalCurCEAS_propagation_hdf5s\\Spacious_CalCurses_Silt_PCHIP_12kHz_20km_50m_BotSensitivity.h5'
+
+
+
+# rl_long is a pandas DataFrame with columns: lat, lon, depth_m, RL, drifterlat, drifterlon, ...
+fig, ax = plot_peak2peak_isosurfaces_long(
+        h5_path,
+        rl_long=rl_df,
+        diveId="dive_167",
+        iso_levels=(90, 110),
+        xy_res=200,
+        z_mode="data"   # or "h5" if you want to force the h5 depth grid
+    )
+
+
+
+
+
+print("normalized:", list(rl_df.columns))
+
+
+detThreshs = [110,115,120]
 
 for thresh in detThreshs:
     # Plot the new iso-surface
-    plot_peak2peak_isosurfaces(
-                    h5_path, corrected_data, diveId ='dive_42',
-                    iso_levels=(thresh,),
+    # rl_long is a pandas DataFrame with columns: lat, lon, depth_m, RL, drifterlat, drifterlon, ...
+
+
+    plot_peak2peak_isosurfaces_long(
+                    h5_path, rl_df, diveId ='dive_167',
+                    iso_levels= [thresh],
                     xy_res=200,
                     seabed_color='0.6',
-                    elev=25, azim=-90)
+                    elev=40, azim=-90)
      
-    plot_detection_probability(h5_path,
-        RLdata, thresh,
-        cmap='viridis',diveId ='dive_42', vmin=0, vmax=1, 
-        title=None, s=40)
+    # plot_detection_probability(h5_path,
+    #     RLdata, thresh,
+    #     cmap='viridis',
+    #     diveId ='dive_42', 
+    #     vmin=0, vmax=1, 
+    #     title=None, s=40)
 
-    stats_df = plot_detection_vs_range(h5_path=h5_path,
-                    RLdata=corrected_data,
-                    threshold_db=thresh,
-                    bin_width_km= .1)
+    # stats_df = plot_detection_vs_range(h5_path=h5_path,
+    #                 RLdata=RLdata,
+    #                 threshold_db=thresh,
+    #                 bin_width_km= .1)
+    # fit_and_plot_hazard_rate_by_location(RLdata= RLdata,
+    #                                          h5_path= h5_path, 
+    #                                          diveId=  "dive_42",
+    #                                          threshold_db = thresh) 
+
     
 #%% Restrict to sperm whale depths
 
-# Get the depth values from the HDF5
-import h5py
+# # Get the depth values from the HDF5
+# import h5py
 
-# Now get the depths
-hf = h5py.File(h5_path, 'r')
-diveId ='dive_42'
-dive_grp = hf[f'drift_01/{diveId}/frequency_35000']
-run_ids = list(dive_grp['arrivals'].keys())
-depth_grid = np.array(dive_grp['depth'])
+# # Now get the depths
+# hf = h5py.File(h5_path, 'r')
+# diveId ='dive_42'
+# dive_grp = hf[f'drift_01/{diveId}/frequency_35000']
+# run_ids = list(dive_grp['arrivals'].keys())
+# depth_grid = np.array(dive_grp['depth'])
 
-# Say 500m to 1200m depth that's column 5 on
-np.nanmax(corrected_data)
-corrected_data[:, 1:4] = -500
-corrected_data[:, 13:27] = -500
+# # Say 500m to 1200m depth that's column 5 on
+# np.nanmax(RLdata)
+# RLdata[:, 1:4] = -500
+# RLdata[:, 13:27] = -500
 
 
-# Plot the new iso-surface
-plot_peak2peak_isosurfaces(
-                h5_path, corrected_data, diveId ='dive_42',
-                iso_levels=(80,),
-                xy_res=200,
-                seabed_color='0.6',
-                elev=25, azim=-90)
+# # Plot the new iso-surface
+# plot_peak2peak_isosurfaces(
+#                 h5_path, RLdata, 
+#                 diveId ='dive_42',
+#                 iso_levels=(140,),
+#                 xy_res=200,
+#                 seabed_color='0.6',
+#                 elev=25, azim=-90)
 
-plot_detection_probability(h5_path,
-    corrected_data, thresh,
-    cmap='viridis',diveId ='dive_42', vmin=0, vmax=1, 
-    title=None, s=40)
+# plot_detection_probability(h5_path,
+#     RLdata, thresh,
+#     cmap='viridis',diveId ='dive_42', vmin=0, vmax=1, 
+#     title=None, s=40)
 
 
 #%% Pipeline Examples
+
+# This section is intended 
 from H5ArrivalsBridge import list_points, load_point_by_index, load_point_near
 from PlottingDefs import (
     build_freq_grid, fig_source_and_grid, fig_absorption,
@@ -190,28 +266,33 @@ from PlottingDefs import (
 
 h5 = h5_path
 drift_id='drift_01'
-dive_id = "dive_24_dec"      # whatever you have
+dive_id = "dive_42"      # whatever you have
 fs = samplerate                   # your click sample rate
 click = click_waveform     # np.ndarray
-
-RLdata = np.genfromtxt('C:\\Users\\kaity\\Desktop\\TestCoherentBellhopCSVS\\PeakToPeak_dive_24_dec_GliderDepth_100m.csv', delimiter=',')
 
 
 # 1) pick a point by index
 arrivals =  load_point_by_index(h5_path, 
                         dive_id, 
-                        pt_index ='pt_00001',
+                        pt_index ='pt_03051',
                         drift_id=drift_id, 
                         freq_khz='frequency_35000',
                         c_eff_m_s=1480.0, 
                         estimate_pathlen_if_missing=True)
 
+
 # 3) build frequency grid and make figures
-freqs = build_freq_grid(2000, 25000, 200, fs=fs)
+freqs = build_freq_grid(2000, 65000, 200, fs=fs)
 fig_source_and_grid(click, fs, freqs)
 fig_absorption(freqs, f_ref_hz=35000.0)
 
 fig3, r = fig_transfer_and_received(click, fs, arrivals, freqs,
+                                    f_ref_hz=35000.0,
+                                    c_eff_m_s=1480.0,
+                                    arrivals_include_absorption=True)
+
+
+fig3, r = fig_signal_ir_output(click, fs, arrivals, freqs,
                                     f_ref_hz=35000.0,
                                     c_eff_m_s=1480.0,
                                     arrivals_include_absorption=True)
@@ -222,10 +303,5 @@ fig4, stats = fig_compare_legacy_vs_coherent(click, fs, arrivals, freqs,
                                              arrivals_include_absorption=True)
 
 
-plot_peak2peak_isosurfaces(
-                h5_path, RLdata, diveId ='dive_24_dec',
-                iso_levels=(30,),
-                xy_res=200,
-                seabed_color='0.6',
-                elev=25, azim=-90)
+
 

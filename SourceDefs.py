@@ -49,15 +49,35 @@ def _offaxis_from_azel(az_deg, el_deg):
     cos_theta = np.clip(vx, -1.0, 1.0)
     return np.arccos(cos_theta)
 
-def _piston_gain(theta, fc=13000.0, a=0.55, c=C_SOUND, eps=1e-9):
-    # |2*J1(ka sinθ)/(ka sinθ)|
+# def _piston_gain(theta, fc=13000.0, a=0.55, c=C_SOUND, eps=1e-9):
+#     # |2*J1(ka sinθ)/(ka sinθ)|
+#     k = 2*np.pi*fc/c
+#     x = k*a*np.sin(theta)
+#     num = 2.0*j1(np.where(x==0, eps, x))
+#     den = np.where(x==0, eps, x)
+#     g = np.abs(num/den)
+#     # normalize to 1 at θ=0
+#     return g / g.max()
+
+def _piston_gain(theta, fc=13000.0, a=0.55, c=C_SOUND):
+    """
+    Circular piston magnitude pattern |2 J1(ka sinθ)/(ka sinθ)|.
+    Already equals 1 at θ=0, so do NOT normalize by g.max().
+    Uses a series limit near θ=0 for numerical stability.
+    """
     k = 2*np.pi*fc/c
-    x = k*a*np.sin(theta)
-    num = 2.0*j1(np.where(x==0, eps, x))
-    den = np.where(x==0, eps, x)
-    g = np.abs(num/den)
-    # normalize to 1 at θ=0
-    return g / g.max()
+    x = k * a * np.sin(theta)
+    # stable small-x limit: 2*J1(x)/x ≈ 1 - x^2/8 + ...
+    small = np.abs(x) < 1e-6
+    g = np.empty_like(x, dtype=float) if np.ndim(x) else float()
+    val = np.abs(2.0 * j1(x) / x)
+    if np.ndim(x):
+        g = val
+        g[small] = 1.0 - (x[small]**2)/8.0
+    else:
+        g = 1.0 - (x**2)/8.0 if small else val
+    return g
+
 
 def _back_lobe_gain(theta, n=2.0):
     # Broad lobe peaking at 180°: G = cos^n(pi - θ), clipped to [0,1]
@@ -139,39 +159,88 @@ def simulate_sperm_click_offaxis(
                    gains=dict(P1=g_p1, P0=g_p0, LF=g_lf),
                    rel_amp=dict(P0=A_p0, LF=A_lf))
 
-
+#%%
 if __name__ == "__main__":
     
     from scipy.io import wavfile
     from PlottingDefs import scaleP2P
-    import os
+    import os, librosa
     
         
     import numpy as np
     import matplotlib.pyplot as plt
 
-    wav_path = "C:\\Users\\kaity\\Documents\\GitHub\\SPACIOUS-Propagation-Modes\\ExampleData\\LF_1705_20171028_010934_441.wav"
- 
+ #   wav_path = "C:\\Users\\kaity\\Documents\\GitHub\\SPACIOUS-Propagation-Modes\\ExampleData\\LF_1705_20171028_010934_441.wav"
+    wav_path = "C:\\Users\\pam_user\\Documents\\GitHub\\SPACIOUS-Propagation-Modes\\ExampleData\\1705_20171028_010934_441.wav"
+
 
     # --- Signal Setup ---
-    samplerate, audiodata = wavfile.read(wav_path)
+    audiodata, samplerate = librosa.load(wav_path, sr=65000,    mono= False)
     t_start, t_end, chan = 32.58, 32.60, 4
-    segment = audiodata[int(round(t_start * samplerate)):int(round(t_end * samplerate)), chan]
+    segment = audiodata[chan, int(round(t_start * samplerate)):int(round(t_end * samplerate))]
     tt = np.linspace(0, len(segment)/samplerate, len(segment))
-    
+    # Adjust figure size and DPI if needed
+    plt.figure(figsize=(11, 5), dpi=100)
+
     
     click_waveform = scaleP2P(segment, outP2P= 220)
 
     
-    
-    # x_onaxis: your on-axis click (NumPy array), fs in Hz
+    # x_onaxis: your on-axis clic☻k (NumPy array), fs in Hz
     y_off, meta = simulate_sperm_click_offaxis(
         click_waveform, fs=samplerate,
         az_deg=180, el_deg=0,         # 25° to the right, level with the rostrum
         depth_m=0,                 # optional, nudges LF resonance (≤~520 m effect strongest)
-        lf_depth_tune=True
+        lf_depth_tune=False,
+        piston_fc = 12000
     )
 
+
+    # import numpy as np
+    # import matplotlib.pyplot as plt
     
-    plt.plot(tt, click_waveform,label= 'on-axis')
-    plt.plot(tt, y_off,label= '180 deg off axis')
+    # # angles you want to evaluate
+    # az_deg = np.arange(360)      # elevation
+    # th_deg = np.arange(360)      # azimuth
+    # AZ, TH = np.meshgrid(az_deg, th_deg, indexing='ij')
+    
+    # def rl_single(az, th):
+    #     y_off, _ = simulate_sperm_click_offaxis(
+    #         click_waveform, fs=samplerate,
+    #         az_deg=float(th), el_deg=float(az),
+    #         depth_m=200, lf_depth_tune=True
+    #     )
+    #     # add tiny eps to avoid log10(0) if waveform is perfectly silent
+    #     return 20.0*np.log10(np.ptp(y_off) + 1e-12)
+    
+    # # vectorized wrapper (keeps API simple)
+    # rl_vec = np.vectorize(rl_single, otypes=[float])
+    # RLs = rl_vec(AZ, TH)
+    
+    # plt.imshow(RLs, cmap='hot', interpolation='nearest',
+    #            origin='lower', extent=[th_deg.min(), th_deg.max(), az_deg.min(), az_deg.max()])
+    # plt.xlabel('Azimuth (deg)')
+    # plt.ylabel('Elevation (deg)')
+    # plt.title('Peak-to-peak RL (dB) by off-axis angle')
+    # plt.colorbar(label='dB')
+    # plt.show()
+
+    
+    # #plt.plot(tt, click_waveform,label= 'on-axis')
+    # plt.plot(tt, y_off,label= '180 deg off axis')
+    RLs = np.empty([360,360])
+    for az in range(360):
+        for theta in range(360):
+            # x_onaxis: your on-axis click (NumPy array), fs in Hz
+            y_off, meta = simulate_sperm_click_offaxis(
+                click_waveform, fs=samplerate,
+                az_deg=theta, el_deg=az,         # 25° to the right, level with the rostrum
+                depth_m=200,                 # optional, nudges LF resonance (≤~520 m effect strongest)
+                lf_depth_tune=True
+                )
+            
+            newp2p =20*np.log10(np.ptp(y_off))
+            print(newp2p)
+            RLs[az, theta] = newp2p
+
+    plt.imshow(RLs, cmap='hot', interpolation='nearest')

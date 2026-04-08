@@ -1128,6 +1128,82 @@ def plot_detection_by_bearing(RLdata: np.ndarray, h5_path: str, diveId: str = "d
     return stats_by_bearing
 
 
+def CreateOutputCSVs_long_worker(
+    h5_path,
+    segment,
+    samplerate,
+    out_path,
+    f_ref_hz=12000,
+):
+    import h5py
+    import numpy as np
+    import pandas as pd
+    import os
+
+    os.makedirs(out_path, exist_ok=True)
+
+    with h5py.File(h5_path, "r") as h5:
+
+        drift_id = list(h5.keys())[0]
+
+        for dive_id in h5[drift_id].keys():
+
+            print(f"Processing {dive_id} in {os.path.basename(h5_path)}")
+
+            grp = h5[drift_id][dive_id][f"frequency_{int(f_ref_hz)}"]
+
+            arrivals_grp = grp["arrivals"]
+            run_ids = list(arrivals_grp.keys())
+
+            lat = np.asarray(grp["lat"]).ravel()
+            lon = np.asarray(grp["lon"]).ravel()
+            depth_grid = np.asarray(grp["depth"])
+
+            rows = []
+
+            for run_idx, run_id in enumerate(run_ids):
+
+                depth_row = depth_grid[run_idx]
+
+                for pt in arrivals_grp[run_id].keys():
+
+                    try:
+                        toa = np.array(arrivals_grp[run_id][pt]["time_of_arrival"])
+                        amp = np.array(arrivals_grp[run_id][pt]["arrival_amplitude"])
+                    except:
+                        continue
+
+                    if toa.size == 0 or amp.size == 0:
+                        continue
+
+                    # simple RL proxy (replace later if needed)
+                    RL = np.abs(amp).max()
+
+                    for d in depth_row:
+                        if not np.isfinite(d) or d == -500:
+                            continue
+
+                        rows.append([
+                            lat[run_idx],
+                            lon[run_idx],
+                            d,
+                            RL
+                        ])
+
+            if len(rows) == 0:
+                print(f"⚠️ No valid data in {dive_id}")
+                continue
+
+            df = pd.DataFrame(rows, columns=["lat", "lon", "depth_m", "RL"])
+
+            out_file = os.path.join(
+                out_path,
+                f"{os.path.basename(h5_path).replace('.h5','')}_{dive_id}.csv"
+            )
+
+            df.to_csv(out_file, index=False)
+
+            print(f"Saved: {out_file} ({len(df)} rows)")
 
 # ============================================================================
 # Plotting long version
