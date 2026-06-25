@@ -277,64 +277,7 @@ def interpolate_sound_speed(dive_data, maxDepth, plot=False):
     )
     return pd.DataFrame({'Depth_m': depth_range, 'SoundSpeed_m_s': sound_speed_interp})
 
-###############################################################################
-# 3)  ––– POOL HELPERS  
-###############################################################################
 
-# # Worker for multiprocessing
-# def _worker(task):
-#     ii, subset_df, drifter_lat, drifter_lon, freq_hz, ssp, drifter_depth
-#     bot_ssp, bot_rho, bot_alpha = task
-    
-    
-#     # If the minimum distane is less than 1km we need a different function that
-    
-#     #print(f'Starting index {ii}')
-#     bathy_vals, path_lon, path_lat, cumulative_distance, actual_distance = extract_bathymetry_from_subset_vectorized(
-#         subset_df=subset_df,
-#         start_lat=drifter_lat,
-#         start_lon=drifter_lon,
-#         stop_lat=subset_df['lat'].iloc[ii],
-#         stop_lon=subset_df['lon'].iloc[ii],
-#         interval=200
-#     )
-#     bathy_grid = pd.DataFrame({'range': cumulative_distance * 1000, 
-#                                'depth_m': -bathy_vals})
-#     bathy_grid.drop_duplicates(inplace=True)
-#     bathy_grid.sort_values('range', inplace=True)
-#     bathy_grid.loc[0, 'range'] = 0
-#     bathy = bathy_grid.apply(lambda row: [row['range'], row['depth_m']], axis=1).tolist()
-    
-#     # Use simulation parameters from Zimmer book and post on biacoustic stack
-#     # exchange
-#     # Silt
-#     env = pm.create_env2d(
-#        depth=bathy,
-#        soundspeed=ssp,
-#        bottom_soundspeed=bot_rho,
-#        bottom_density=bot_ssp,
-#        bottom_absorption=bot_alpha, 
-#        tx_depth=drifter_depth,
-#        frequency=freq_hz,
-#        nbeams=0,
-#        max_angle=90,
-#        min_angle=-90,
-#        soundspeed_interp='pchip')
-
-#     if actual_distance < 1.1:
-#        env['rx_range'] = actual_distance * 1000
-#        env['rx_depth'] = np.arange(0, bathy_grid['depth_m'].iloc[0], 100)
-#     else:
-#        env['rx_range'] = bathy_grid['range'].iloc[-1]
-#        env['rx_depth'] = np.arange(0, bathy_grid['depth_m'].iloc[-1], 100)
-       
-   
-#     arr = pm.compute_arrivals(env)
-#     tlosDb = np.full(len(env['rx_depth']), np.nan) # omit for now
-    
-
-#     #print(f'done! {ii}')
-#     return ii, tlosDb, arr, env['rx_depth']
 
 def _worker(task):
     (ii, subset_df, drifter_lat, drifter_lon, freq_hz, ssp, drifter_depth,

@@ -91,6 +91,8 @@ click = click_waveform     # np.ndarray
 
 RLdata = np.genfromtxt('C:\\Users\\kaity\\Desktop\\TestCoherentBellhopCSVS\\PeakToPeak_dive_24_dec_GliderDepth_100m.csv', delimiter=',')
 
+RLdata = np.genfromtxt('X:\\Kaitlin_Palmer\\BotSensitivityCSVs_WHICEAS_clip\\BotSensitivityCSVs\\silt\\PeakToPeak_dive_167_GliderDepth_500m_0_29khz_long.csv', delimiter=',')
+h5_path = 'X:\\Kaitlin_Palmer\\CalCurCEAS_propagation_hdf5s\\Spacious_CalCurses_silt_PCHIP_12kHz_20km_500m_BotSensitivity.h5'
 
 # 1) pick a point by index
 arrivals =  load_point_by_index(h5_path, 

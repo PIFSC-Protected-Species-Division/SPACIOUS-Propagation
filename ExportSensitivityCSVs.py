@@ -145,7 +145,6 @@ for h5file in result:
 #         samplerate=samplerate,
 #         out_path=str(out_path),
 #         coherent=True,
-#         nWorkers=1,                  # 🔴 critical change
 #         f_ref_hz=12000,
 #         prefer_processes=False,
 #         fmin_hz=100,

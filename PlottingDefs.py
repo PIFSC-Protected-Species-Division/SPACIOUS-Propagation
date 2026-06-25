@@ -8,6 +8,8 @@ Key points:
 - Workers open HDF5 inside the worker (no unpicklables passed).
 """
 
+from __future__ import annotations
+
 import os
 import sys
 import numpy as np
@@ -17,6 +19,7 @@ import matplotlib.pyplot as plt
 from matplotlib import cm
 from mpl_toolkits.mplot3d.art3d import Poly3DCollection
 from scipy.interpolate import griddata, NearestNDInterpolator
+from scipy.ndimage import gaussian_filter
 from skimage import measure
 from geopy.distance import geodesic
 from pyproj import Transformer, Geod
@@ -892,15 +895,145 @@ def _precompute_source_on_grid(segment: np.ndarray, fs: int, freqs_hz: np.ndarra
 
 def plot_peak2peak_isosurfaces(h5_path: str, pp_grid: np.ndarray, diveId: str = "dive_42",
                                iso_levels=(90,), xy_res=200, cmap=cm.viridis,
-                               seabed_color="0.6", elev=25, azim=-45):
-    """Marching-cubes 3D visualization of p2p iso-levels over a local UTM grid."""
+                               seabed_color="0.6", elev=25, azim=-45, freq_hz=None,
+                               source_depth_m=500.0,
+                               source_x_m=None, source_y_m=None,
+                               source_marker=None, source_color=None, source_size=None,
+                               interp_method="linear", smooth_sigma=0.8,
+                               marching_step_size=1, save_path=None, save_dpi=600,
+                               show_plot=True, fig_size=(10, 8), save_transparent=False,
+                               title=None, render_mode=None):
+    """
+    3D Marching-cubes visualization of peak-to-peak iso-surfaces over a local UTM grid.
+
+    **Data Input:**
+        h5_path (str)          – Path to HDF5 file with acoustic propagation model
+        pp_grid (ndarray)      – 2D peak-to-peak grid (Nxy, Nz) or DataFrame with lat/lon/depth_m/RL
+        diveId (str)           – Dive identifier key in HDF5 (default 'dive_42')
+        freq_hz (int|None)     – Target frequency (Hz); auto-selects if None
+
+    **Iso-Surface Control:**
+        iso_levels (tuple|list) – RL/peak-to-peak levels in dB (default (90,))
+        xy_res (int)           – Horizontal grid resolution (default 200)
+
+    **Source & Seabed:**
+        source_depth_m (float) – Glider source depth in meters (default 500.0)
+        source_x_m (float|None)– Custom source X coordinate (UTM East, m); auto-loaded if None
+        source_y_m (float|None)– Custom source Y coordinate (UTM North, m); auto-loaded if None
+        source_marker/color/size – (Optional) Override glider marker appearance
+        seabed_color (str)     – Matplotlib color for seabed surface (default '0.6' = gray)
+
+    **View & Rendering:**
+        elev (float)           – 3D view elevation angle (0–90°; default 25)
+        azim (float)           – 3D view azimuth angle (0–360°; default -45)
+        cmap (colormap)        – Matplotlib colormap for iso-surface colors (default viridis)
+
+    **Interpolation & Smoothing (use render_mode presets or tune manually):**
+        interp_method (str)    – 'linear' (fast) or 'cubic' (smooth); default 'linear'
+        smooth_sigma (float)   – Gaussian filter σ per depth slice; 0 disables (default 0.8)
+        marching_step_size (int) – Step size in marching cubes (1=full res, 2+3=faster; default 1)
+
+    **Output & Export:**
+        save_path (str|None)   – If set, saves figure to this path (PNG, PDF, etc.)
+        save_dpi (int)         – Resolution for saved figure in DPI (default 600)
+        save_transparent (bool)– Transparent background when saving (default False)
+        show_plot (bool)       – Display plot interactively (default True); set False for headless
+        fig_size (tuple)       – Figure size (width, height) in inches; default (10, 8)
+        title (str|None)       – Custom plot title; if None, uses auto-generated default
+
+    **Rendering Presets (convenience; override interp_method/smooth_sigma/marching_step_size/fig_size):**
+        render_mode (str|None) – One of:
+            'fast'        → linear interp, σ=0.5, step=2  (quick preview, 10–30 sec)
+            'balanced'    → linear interp, σ=0.8, step=1  (recommended, 30–60 sec)
+            'publication'→ cubic interp,  σ=1.0, step=1, 12×10 fig (slower, ~2 min, best quality)
+    """
+    _RENDER_PRESETS = {
+        "fast":        dict(interp_method="linear", smooth_sigma=0.5, marching_step_size=2),
+        "balanced":    dict(interp_method="linear", smooth_sigma=0.8, marching_step_size=1),
+        "publication": dict(interp_method="cubic",  smooth_sigma=1.0, marching_step_size=1, fig_size=(12, 10)),
+    }
+    if render_mode is not None:
+        _preset = _RENDER_PRESETS.get(str(render_mode).lower())
+        if _preset is None:
+            raise ValueError(f"render_mode must be one of {list(_RENDER_PRESETS)}; got {render_mode!r}")
+        interp_method    = _preset.get("interp_method",    interp_method)
+        smooth_sigma     = _preset.get("smooth_sigma",     smooth_sigma)
+        marching_step_size = _preset.get("marching_step_size", marching_step_size)
+        fig_size         = _preset.get("fig_size",         fig_size)
+
+    if isinstance(pp_grid, pd.DataFrame):
+        normalized_cols = {str(col).strip().lower() for col in pp_grid.columns}
+        long_required_cols = {"lat", "lon", "depth_m", "rl"}
+        if long_required_cols.issubset(normalized_cols):
+            return plot_peak2peak_isosurfaces_long(
+                h5_path=h5_path,
+                rl_long=pp_grid,
+                diveId=diveId,
+                iso_levels=iso_levels,
+                xy_res=xy_res,
+                cmap=cmap,
+                seabed_color=seabed_color,
+                elev=elev,
+                azim=azim,
+                freq_hz=freq_hz,
+                source_depth_m=source_depth_m,
+                interp_method=interp_method,
+                smooth_sigma=smooth_sigma,
+                marching_step_size=marching_step_size,
+                save_path=save_path,
+                save_dpi=save_dpi,
+                show_plot=show_plot,
+                fig_size=fig_size,
+                save_transparent=save_transparent,
+                title=title,
+                render_mode=render_mode,
+            )
+        pp_grid = pp_grid.to_numpy(dtype=float, copy=False)
+    elif isinstance(pp_grid, pd.Series):
+        pp_grid = pp_grid.to_numpy(dtype=float, copy=False)
+    else:
+        pp_grid = np.asarray(pp_grid, dtype=float)
+
+    if pp_grid.ndim != 2:
+        raise ValueError(
+            f"plot_peak2peak_isosurfaces expected a 2D peak-to-peak grid; got shape {pp_grid.shape}"
+        )
+
     with h5py.File(h5_path, "r") as hf:
-        grp = hf[f"drift_01/{diveId}/frequency_35000"]
+        dive_grp = hf[f"drift_01/{diveId}"]
+
+        # Auto-select frequency group if not specified
+        try:
+            freq_key = _select_frequency_key(dive_grp, target_hz=freq_hz)
+        except KeyError as exc:
+            raise KeyError(
+                f"plot_peak2peak_isosurfaces failed for dive '{diveId}': "
+                f"unable to select a frequency group"
+                + (f" matching target frequency {freq_hz} Hz" if freq_hz is not None else "")
+                + "."
+            ) from exc
+        grp = dive_grp[freq_key]
         depth_grid = np.array(grp["depth"])
         lat = np.array(grp["lat"])
         lon = np.array(grp["lon"])
         drifter_lat = float(grp.parent.attrs["start_lat"])
         drifter_lon = float(grp.parent.attrs["start_lon"])
+
+    if np.isscalar(iso_levels):
+        iso_levels = (float(iso_levels),)
+    else:
+        iso_levels = tuple(float(level) for level in iso_levels)
+
+    # Use caller-provided source position when available; default to drifter origin.
+    source_x_plot = 0.0 if source_x_m is None else float(source_x_m)
+    source_y_plot = 0.0 if source_y_m is None else float(source_y_m)
+    source_depth_plot = float(source_depth_m)
+
+    if pp_grid.shape != depth_grid.shape:
+        raise ValueError(
+            "plot_peak2peak_isosurfaces received a peak-to-peak grid whose shape does not match "
+            f"the selected frequency group's depth grid: pp_grid={pp_grid.shape}, depth_grid={depth_grid.shape}"
+        )
 
     # Local UTM centered at drifter
     utm_zone = int((drifter_lon + 180) // 6) + 1
@@ -927,9 +1060,17 @@ def plot_peak2peak_isosurfaces(h5_path: str, pp_grid: np.ndarray, diveId: str = 
         pts = np.column_stack((x[valid], y[valid]))
         vals = pp_grid[valid, k]
         try:
-            PP_slice = griddata(pts, vals, (X2d, Y2d), method="cubic")
+            PP_slice = griddata(pts, vals, (X2d, Y2d), method=interp_method)
         except Exception:
             PP_slice = NearestNDInterpolator(pts, vals)(X2d, Y2d)
+
+        if smooth_sigma and smooth_sigma > 0:
+            valid_slice = np.isfinite(PP_slice)
+            if np.any(valid_slice):
+                fill_value = float(np.nanmedian(PP_slice[valid_slice]))
+                smoothed = gaussian_filter(np.nan_to_num(PP_slice, nan=fill_value), sigma=float(smooth_sigma))
+                PP_slice = np.where(valid_slice, smoothed, np.nan)
+
         PP_vol[k] = PP_slice
 
     finite_vals = PP_vol[np.isfinite(PP_vol)]
@@ -938,7 +1079,7 @@ def plot_peak2peak_isosurfaces(h5_path: str, pp_grid: np.ndarray, diveId: str = 
     real_min, real_max = finite_vals.min(), finite_vals.max()
     nan_fill = real_min - 1.0
 
-    fig = plt.figure(figsize=(10, 8))
+    fig = plt.figure(figsize=fig_size)
     ax = fig.add_subplot(111, projection="3d")
     ax.set_facecolor("white")
 
@@ -947,7 +1088,11 @@ def plot_peak2peak_isosurfaces(h5_path: str, pp_grid: np.ndarray, diveId: str = 
             print(f"⚠️  Skipping {level} dB – outside [{real_min:.1f}, {real_max:.1f}] dB")
             continue
         try:
-            verts, faces, _, _ = measure.marching_cubes(np.nan_to_num(PP_vol, nan=nan_fill), level=level)
+            verts, faces, _, _ = measure.marching_cubes(
+                np.nan_to_num(PP_vol, nan=nan_fill),
+                level=level,
+                step_size=max(1, int(marching_step_size)),
+            )
         except RuntimeError as e:
             print(f"⚠️  marching_cubes failed for {level} dB: {e}")
             continue
@@ -974,14 +1119,51 @@ def plot_peak2peak_isosurfaces(h5_path: str, pp_grid: np.ndarray, diveId: str = 
     ax.plot_surface(X2d, Y2d, np.ma.masked_invalid(seabed_grid),
                     color=seabed_color, alpha=0.6, linewidth=0, antialiased=False)
 
+    # Add a vertical guide to make the depth location easier to read in perspective views.
+    ax.plot(
+        [source_x_plot, source_x_plot],
+        [source_y_plot, source_y_plot],
+        [0.0, source_depth_plot],
+        color="red",
+        linestyle="--",
+        linewidth=1.6,
+        alpha=0.9,
+    )
+    ax.scatter(
+        [source_x_plot], [source_y_plot], [source_depth_plot],
+        c="red", s=180, marker="o",
+        edgecolors="white", linewidths=1.0, depthshade=False,
+        label=f"Glider Source ({source_depth_plot:.0f} m)"
+    )
+    ax.text(
+        source_x_plot,
+        source_y_plot,
+        source_depth_plot,
+        f" {source_depth_plot:.0f} m",
+        color="red",
+        fontsize=9,
+    )
+
     ax.set_xlabel("East–West range (m)")
     ax.set_ylabel("North–South range (m)")
     ax.set_zlabel("Depth (m)")
-    ax.set_zlim(np.nanmax(seabed_raw), 0)
-    ax.set_title(f"Peak-to-Peak Iso-Surfaces ({iso_levels} dB re 1 µPa p-p)")
+    zmax_plot = float(np.nanmax([np.nanmax(seabed_raw), source_depth_plot]))
+    ax.set_zlim(zmax_plot, 0)
+    if title is None:
+        title = f"Peak-to-Peak Iso-Surfaces ({iso_levels} dB re 1 µPa p-p)"
+    ax.set_title(title)
     ax.view_init(elev=elev, azim=azim)
+    ax.legend(loc="upper right")
     plt.tight_layout()
-    plt.show()
+
+    if save_path:
+        fig.savefig(save_path, dpi=int(save_dpi), bbox_inches="tight", transparent=bool(save_transparent))
+    if show_plot:
+        plt.show()
+    else:
+        plt.close(fig)
+
+    return fig, ax
 
 def plot_detection_probability(h5_path: str, RLdata: np.ndarray, threshold_db: float,
                                cmap="viridis", diveId: str = "dive_42", vmin=0, vmax=1,
@@ -1016,6 +1198,104 @@ def plot_detection_probability(h5_path: str, RLdata: np.ndarray, threshold_db: f
     ax.grid(True); ax.axis("equal")
     plt.tight_layout(); plt.show()
     return detection_prob
+
+
+
+def plot_detection_probability_long(h5_path: str,
+                                    rl_long: "pd.DataFrame",
+                                    threshold_db: float,
+                                    cmap="viridis",
+                                    diveId: str = "dive_42",
+                                    vmin=0,
+                                    vmax=1,
+                                    title=None,
+                                    s=40,
+                                    lat_col: str = "lat",
+                                    lon_col: str = "lon",
+                                    val_col: str = "RL",
+                                    drifter_lat_col: str = "drifterlat",
+                                    drifter_lon_col: str = "drifterlon",
+                                    freq_hz=None):
+    """Scatter map of detection probability per location from LONG-format RL data."""
+    if rl_long is None or len(rl_long) == 0:
+        raise ValueError("rl_long is empty")
+
+    df = rl_long.copy()
+    df.columns = df.columns.astype(str).str.strip()
+
+    for col in (lat_col, lon_col, val_col):
+        if col not in df.columns:
+            raise ValueError(f"rl_long missing required column '{col}'. Found: {list(df.columns)}")
+
+    df[lat_col] = pd.to_numeric(df[lat_col], errors="coerce")
+    df[lon_col] = pd.to_numeric(df[lon_col], errors="coerce")
+    df[val_col] = pd.to_numeric(df[val_col], errors="coerce")
+
+    valid = np.isfinite(df[lat_col]) & np.isfinite(df[lon_col]) & np.isfinite(df[val_col])
+    df = df.loc[valid].copy()
+    if len(df) == 0:
+        raise RuntimeError("No finite rows in rl_long after cleaning numeric columns")
+
+    # Keep legacy validity convention (-500 sentinel) while supporting long tables.
+    is_valid = df[val_col].to_numpy() > -500
+    is_detected = df[val_col].to_numpy() > threshold_db
+    df["_valid"] = is_valid.astype(int)
+    df["_det"] = (is_detected & is_valid).astype(int)
+
+    grouped = (
+        df.groupby([lat_col, lon_col], as_index=False)
+          .agg(valid_count=("_valid", "sum"), det_count=("_det", "sum"))
+    )
+    grouped["detection_prob"] = grouped["det_count"] / np.maximum(grouped["valid_count"], 1)
+    grouped["detection_prob"] = np.nan_to_num(grouped["detection_prob"].to_numpy(), nan=0.0)
+
+    # Drifter origin: prefer columns in long data; fallback to HDF5 attrs.
+    if (drifter_lat_col in df.columns) and (drifter_lon_col in df.columns):
+        dlat = pd.to_numeric(df[drifter_lat_col], errors="coerce").dropna()
+        dlon = pd.to_numeric(df[drifter_lon_col], errors="coerce").dropna()
+        if len(dlat) > 0 and len(dlon) > 0:
+            drifter_lat = float(dlat.iloc[0])
+            drifter_lon = float(dlon.iloc[0])
+        else:
+            with h5py.File(h5_path, "r") as hf:
+                dive_grp = hf[f"drift_01/{diveId}"]
+                freq_key = _select_frequency_key(dive_grp, target_hz=freq_hz)
+                grp = dive_grp[freq_key]
+                drifter_lat = float(grp.parent.attrs["start_lat"])
+                drifter_lon = float(grp.parent.attrs["start_lon"])
+    else:
+        with h5py.File(h5_path, "r") as hf:
+            dive_grp = hf[f"drift_01/{diveId}"]
+            freq_key = _select_frequency_key(dive_grp, target_hz=freq_hz)
+            grp = dive_grp[freq_key]
+            drifter_lat = float(grp.parent.attrs["start_lat"])
+            drifter_lon = float(grp.parent.attrs["start_lon"])
+
+    utm_zone = int((drifter_lon + 180) // 6) + 1
+    hemisphere = "north" if drifter_lat >= 0 else "south"
+    transformer = Transformer.from_crs(
+        "epsg:4326", f"+proj=utm +zone={utm_zone} +{hemisphere} +datum=WGS84", always_xy=True
+    )
+
+    lon = grouped[lon_col].to_numpy(dtype=float)
+    lat = grouped[lat_col].to_numpy(dtype=float)
+    x, y = transformer.transform(lon, lat)
+    x0, y0 = transformer.transform(drifter_lon, drifter_lat)
+    x, y = x - x0, y - y0
+
+    fig, ax = plt.subplots(figsize=(8, 6))
+    sc = ax.scatter(x, y, c=grouped["detection_prob"].to_numpy(), cmap=cmap, vmin=vmin, vmax=vmax, s=s)
+    fig.colorbar(sc, ax=ax, label="Detection Probability")
+    ax.set_xlabel("East-West Range (m)")
+    ax.set_ylabel("North-South Range (m)")
+    ax.set_title(title or f"Detection Probability (Threshold: {threshold_db} dB)")
+    ax.grid(True)
+    ax.axis("equal")
+    plt.tight_layout()
+    plt.show()
+
+    return grouped
+
 
 def plot_detection_vs_range(h5_path: str, RLdata: np.ndarray, diveId: str = "dive_42",
                             threshold_db: float = 120.0, bin_width_km: float = 1.0,
@@ -1275,6 +1555,22 @@ def plot_peak2peak_isosurfaces_long(
     drifter_lon_col: str = "drifterlon",
     # frequency selection
     freq_hz=None,              # e.g. 12000; if None, auto-picks
+    source_depth_m=500.0,
+    source_x_m=None,
+    source_y_m=None,
+    source_marker=None,
+    source_color=None,
+    source_size=None,
+    interp_method="linear",
+    smooth_sigma=0.8,
+    marching_step_size=1,
+    save_path=None,
+    save_dpi=600,
+    show_plot=True,
+    fig_size=(10, 8),
+    save_transparent=False,
+    title=None,
+    render_mode=None,
     # how to choose the Z slices
     z_mode: str = "data",      # "data" (unique depths in rl_long) or "h5" (use h5 depth grid)
     depth_tol_m: float = 0.5,  # only used when z_mode="h5" and matching data to h5 depths
@@ -1283,10 +1579,82 @@ def plot_peak2peak_isosurfaces_long(
     pad_m: float = 0.0         # padding added to extents (meters)
 ):
     """
-    Marching-cubes 3D visualization of iso-levels over a local UTM grid, using LONG-format RL/PP data.
+    3D Marching-cubes visualization of iso-surfaces over a local UTM grid using LONG-format RL/PP data.
 
-    rl_long must contain columns: lat, lon, depth_m, RL (plus optional drifterlat/drifterlon).
+    **Data Input:**
+        h5_path (str)          – Path to HDF5 file with acoustic propagation model metadata
+        rl_long (DataFrame)    – Long-format data with columns: lat, lon, depth_m, RL (±optional drifterlat/drifterlon)
+        diveId (str)           – Dive identifier key in HDF5 (default 'dive_42')
+        freq_hz (int|None)     – Target frequency (Hz); auto-selects if None
+
+    **Column Names (customizable for Excel/R imports):**
+        lat_col (str)          – Latitude column name (default 'lat')
+        lon_col (str)          – Longitude column name (default 'lon')
+        depth_col (str)        – Depth column name (default 'depth_m')
+        val_col (str)          – RL/value column name (default 'RL')
+        drifter_lat_col/drifter_lon_col – Optional drifter position columns
+
+    **Iso-Surface Control:**
+        iso_levels (tuple|list)– RL/value levels to visualize (default (90,))
+        xy_res (int)           – Horizontal grid resolution (default 200)
+
+    **Depth Slice Mode (z_mode):**
+        z_mode (str)           – How to select depth slices:
+            'data'     → Use unique depths from rl_long (default)
+            'h5'       → Use depths from HDF5 model grid
+        depth_tol_m (float)    – Tolerance (m) for matching 'data' depths to 'h5' depths (default 0.5)
+
+    **Spatial Extent & Padding:**
+        extent_mode (str)      – Horizontal extent source:
+            'h5'       → Use model grid extent (default)
+            'data'     → Use rl_long data extent
+        pad_m (float)          – Padding added to extent in all directions (default 0.0)
+        xy_res (int)           – Horizontal interpolation resolution (default 200)
+
+    **Source & Seabed:**
+        source_depth_m (float) – Glider source depth in meters (default 500.0)
+        source_x_m (float|None)– Custom source X coordinate (UTM East, m); auto-loaded if None
+        source_y_m (float|None)– Custom source Y coordinate (UTM North, m); auto-loaded if None
+        source_marker/color/size – (Optional) Override glider marker appearance
+        seabed_color (str)     – Matplotlib color for seabed surface (default '0.6' = gray)
+
+    **View & Rendering:**
+        elev (float)           – 3D view elevation angle (0–90°; default 25)
+        azim (float)           – 3D view azimuth angle (0–360°; default -45)
+        cmap (colormap)        – Matplotlib colormap for iso-surface colors (default viridis)
+
+    **Interpolation & Smoothing (use render_mode presets or tune manually):**
+        interp_method (str)    – 'linear' (fast) or 'cubic' (smooth); default 'linear'
+        smooth_sigma (float)   – Gaussian filter σ per depth slice; 0 disables (default 0.8)
+        marching_step_size (int) – Step size in marching cubes (1=full res, 2+3=faster; default 1)
+
+    **Output & Export:**
+        save_path (str|None)   – If set, saves figure to this path (PNG, PDF, etc.)
+        save_dpi (int)         – Resolution for saved figure in DPI (default 600)
+        save_transparent (bool)– Transparent background when saving (default False)
+        show_plot (bool)       – Display plot interactively (default True); set False for headless
+        fig_size (tuple)       – Figure size (width, height) in inches; default (10, 8)
+        title (str|None)       – Custom plot title; if None, uses auto-generated default
+
+    **Rendering Presets (convenience; override interp_method/smooth_sigma/marching_step_size/fig_size):**
+        render_mode (str|None) – One of:
+            'fast'        → linear interp, σ=0.5, step=2  (quick preview, 10–30 sec)
+            'balanced'    → linear interp, σ=0.8, step=1  (recommended, 30–60 sec)
+            'publication'→ cubic interp,  σ=1.0, step=1, 12×10 fig (slower, ~2 min, best quality)
     """
+    _RENDER_PRESETS = {
+        "fast":        dict(interp_method="linear", smooth_sigma=0.5, marching_step_size=2),
+        "balanced":    dict(interp_method="linear", smooth_sigma=0.8, marching_step_size=1),
+        "publication": dict(interp_method="cubic",  smooth_sigma=1.0, marching_step_size=1, fig_size=(12, 10)),
+    }
+    if render_mode is not None:
+        _preset = _RENDER_PRESETS.get(str(render_mode).lower())
+        if _preset is None:
+            raise ValueError(f"render_mode must be one of {list(_RENDER_PRESETS)}; got {render_mode!r}")
+        interp_method    = _preset.get("interp_method",    interp_method)
+        smooth_sigma     = _preset.get("smooth_sigma",     smooth_sigma)
+        marching_step_size = _preset.get("marching_step_size", marching_step_size)
+        fig_size         = _preset.get("fig_size",         fig_size)
 
     # --- Basic validation ---
     if rl_long is None or len(rl_long) == 0:
@@ -1327,6 +1695,16 @@ def plot_peak2peak_isosurfaces_long(
 
         h5_drifter_lat = float(grp.parent.attrs["start_lat"])
         h5_drifter_lon = float(grp.parent.attrs["start_lon"])
+
+    if np.isscalar(iso_levels):
+        iso_levels = (float(iso_levels),)
+    else:
+        iso_levels = tuple(float(level) for level in iso_levels)
+
+    # Use caller-provided source position when available; default to drifter origin.
+    source_x_plot = 0.0 if source_x_m is None else float(source_x_m)
+    source_y_plot = 0.0 if source_y_m is None else float(source_y_m)
+    source_depth_plot = float(source_depth_m)
 
     # --- Drifter origin: prefer data columns if present ---
     drifter_lat, drifter_lon = h5_drifter_lat, h5_drifter_lon
@@ -1417,9 +1795,16 @@ def plot_peak2peak_isosurfaces_long(
             continue
 
         try:
-            sl = griddata(pts, vals, (X2d, Y2d), method="cubic")
+            sl = griddata(pts, vals, (X2d, Y2d), method=interp_method)
         except Exception:
             sl = NearestNDInterpolator(pts, vals)(X2d, Y2d)
+
+        if smooth_sigma and smooth_sigma > 0:
+            valid_slice = np.isfinite(sl)
+            if np.any(valid_slice):
+                fill_value = float(np.nanmedian(sl[valid_slice]))
+                smoothed = gaussian_filter(np.nan_to_num(sl, nan=fill_value), sigma=float(smooth_sigma))
+                sl = np.where(valid_slice, smoothed, np.nan)
 
         RL_vol[k] = sl
 
@@ -1431,7 +1816,7 @@ def plot_peak2peak_isosurfaces_long(
     nan_fill = real_min - 1.0
 
     # --- Plot ---
-    fig = plt.figure(figsize=(10, 8))
+    fig = plt.figure(figsize=fig_size)
     ax = fig.add_subplot(111, projection="3d")
     ax.set_facecolor("white")
 
@@ -1445,6 +1830,7 @@ def plot_peak2peak_isosurfaces_long(
             verts, faces, _, _ = measure.marching_cubes(
                 np.nan_to_num(RL_vol, nan=nan_fill),
                 level=level,
+                step_size=max(1, int(marching_step_size)),
             )
         except RuntimeError as e:
             print(f"⚠️  marching_cubes failed for {level}: {e}")
@@ -1485,19 +1871,53 @@ def plot_peak2peak_isosurfaces_long(
             X2d, Y2d, np.ma.masked_invalid(seabed_grid),
             color=seabed_color, alpha=0.6, linewidth=0, antialiased=False
         )
-        zmax = float(np.nanmax(seabed_raw))
+        zmax = float(np.nanmax([np.nanmax(seabed_raw), source_depth_plot]))
     except Exception as e:
         print(f"⚠️  Seabed surface skipped: {e}")
-        zmax = float(np.nanmax(z_vec)) if len(z_vec) else 0.0
+        zmax = float(np.nanmax([np.nanmax(z_vec), source_depth_plot])) if len(z_vec) else float(source_depth_plot)
+
+    # Add a vertical guide to make the depth location easier to read in perspective views.
+    ax.plot(
+        [source_x_plot, source_x_plot],
+        [source_y_plot, source_y_plot],
+        [0.0, source_depth_plot],
+        color="red",
+        linestyle="--",
+        linewidth=1.6,
+        alpha=0.9,
+    )
+    ax.scatter(
+        [source_x_plot], [source_y_plot], [source_depth_plot],
+        c="red", s=180, marker="o",
+        edgecolors="white", linewidths=1.0, depthshade=False,
+        label=f"Glider Source ({source_depth_plot:.0f} m)"
+    )
+    ax.text(
+        source_x_plot,
+        source_y_plot,
+        source_depth_plot,
+        f" {source_depth_plot:.0f} m",
+        color="red",
+        fontsize=9,
+    )
 
     ax.set_xlabel("East–West range (m)")
     ax.set_ylabel("North–South range (m)")
     ax.set_zlabel("Depth (m)")
     ax.set_zlim(zmax, 0)
-    ax.set_title(f"Iso-Surfaces ({iso_levels}) from '{val_col}'")
+    if title is None:
+        title = f"Iso-Surfaces ({iso_levels}) from '{val_col}'"
+    ax.set_title(title)
     ax.view_init(elev=elev, azim=azim)
+    ax.legend(loc="upper right")
     plt.tight_layout()
-    plt.show()
+
+    if save_path:
+        fig.savefig(save_path, dpi=int(save_dpi), bbox_inches="tight", transparent=bool(save_transparent))
+    if show_plot:
+        plt.show()
+    else:
+        plt.close(fig)
 
     return fig, ax
 

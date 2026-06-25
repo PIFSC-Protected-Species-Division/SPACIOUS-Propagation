@@ -110,7 +110,7 @@ for h5file in result:
 #%% Load the RL grid in the previous section and make plots 
 
 rLlOC = 'X:\\Kaitlin_Palmer\\CalCurCEAS_propagation_csvs\\PeakToPeak_dive_42_GliderDepth_500m.csv'
-rLlOC = 'X:\\Kaitlin_Palmer\\BotSensitivityCSVs\\silt\\PeakToPeak_dive_167_GliderDepth_500m_1_20khz_long.csv'
+rLlOC = 'X:\\Kaitlin_Palmer\\BotSensitivityCSVs\\si'
 
 RLdata = np.genfromtxt(rLlOC, delimiter=',')
 
@@ -137,13 +137,47 @@ corrected_data = apply_alpha_correction(h5_path= h5_path,
                                         alpha_db_per_km=alphachange, 
                                         diveId ='dive_42')
 
+import pandas as pd
+
+rLlOC = 'X:\\Kaitlin_Palmer\\BotSensitivityCSVs_WHICEAS_clip\\BotSensitivityCSVs\\silt\\PeakToPeak_dive_167_GliderDepth_500m_0_29khz_long.csv'
+rl_df = pd.read_csv(rLlOC)
+
+h5_path = 'X:\\Kaitlin_Palmer\\CalCurCEAS_propagation_hdf5s\\Spacious_CalCurses_silt_PCHIP_12kHz_20km_500m_BotSensitivity.h5'
+
+
+
+
 # Plot the new iso-surface
 plot_peak2peak_isosurfaces(
-                h5_path, corrected_data, diveId ='dive_42',
-                iso_levels=(80,),
+                h5_path, 
+                rl_df, 
+                diveId ='dive_167',
+                title = 'Site 163 135 dB Isopleth',
+                iso_levels=(140,),  
                 xy_res=200,
+                source_depth_m=100,
+                interp_method='cubic', # default linear, faster
+                source_x_m=0,
+                source_y_m=0,
                 seabed_color='0.6',
-                elev=25, azim=-90)
+                elev=26, 
+                azim=-75,
+                render_mode='publication') # default 'fast')
+
+
+# Quick preview
+plot_peak2peak_isosurfaces(..., render_mode="fast")
+
+# Balanced quality (default)
+plot_peak2peak_isosurfaces(..., render_mode="balanced")
+
+# Publication quality (higher-res, cubic interpolation, larger figure)
+plot_peak2peak_isosurfaces(..., render_mode="publication", 
+                           save_path="figure.png", save_dpi=600)
+
+
+
+
  
 plot_detection_probability(h5_path,
     RLdata, 80,
@@ -166,11 +200,11 @@ stats_dict = plot_detection_by_bearing(
 
 import pandas as pd
 
-rLlOC = 'X:\\Kaitlin_Palmer\\BotSensitivityCSVs\\silt\\PeakToPeak_dive_167_GliderDepth_500m_1_20khz_long.csv'
+rLlOC = 'X:\\Kaitlin_Palmer\\BotSensitivityCSVs_WHICEAS_clip\\BotSensitivityCSVs\\silt\\PeakToPeak_dive_167_GliderDepth_500m_0_29khz_long.csv'
 rl_df = pd.read_csv(rLlOC)
 
 
-h5_path = 'X:\\Kaitlin_Palmer\\CalCurCEAS_propagation_hdf5s\\Spacious_CalCurses_Silt_PCHIP_12kHz_20km_50m_BotSensitivity.h5'
+h5_path = 'X:\\Kaitlin_Palmer\\CalCurCEAS_propagation_hdf5s\\Spacious_CalCurses_silt_PCHIP_12kHz_20km_500m_BotSensitivity.h5'
 
 
 
@@ -179,7 +213,7 @@ fig, ax = plot_peak2peak_isosurfaces_long(
         h5_path,
         rl_long=rl_df,
         diveId="dive_167",
-        iso_levels=(90, 110),
+        iso_levels=(135),
         xy_res=200,
         z_mode="data"   # or "h5" if you want to force the h5 depth grid
     )
