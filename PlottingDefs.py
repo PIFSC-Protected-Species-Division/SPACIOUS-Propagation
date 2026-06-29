@@ -134,6 +134,96 @@ def p2pArrivalSNR(arrivals: dict, segment: np.ndarray, fs: int):
     return np.round(p2p_db, 1), out_real
 
 
+_SUPPORTED_METRICS = {
+    "p2p": "p2p",
+    "dbband10": "dBBand10",
+    "db_band10": "dBBand10",
+    "dBband10": "dBBand10",
+    "dBBand10": "dBBand10",
+    "10dbbandwidth": "dBBand10",
+}
+
+
+def _normalize_metric_names(metrics):
+    """Accept a metric string/list and return canonical metric names."""
+    if metrics is None:
+        raw = ["p2p"]
+    elif isinstance(metrics, str):
+        raw = [metrics]
+    else:
+        raw = list(metrics)
+
+    if len(raw) == 0:
+        raise ValueError("At least one metric must be provided")
+
+    out = []
+    seen = set()
+    for name in raw:
+        key = str(name).strip()
+        if key == "":
+            continue
+        normalized = _SUPPORTED_METRICS.get(key, _SUPPORTED_METRICS.get(key.lower()))
+        if normalized is None:
+            valid = sorted(set(_SUPPORTED_METRICS.values()))
+            raise ValueError(f"Unknown metric '{name}'. Supported metrics: {valid}")
+        if normalized not in seen:
+            seen.add(normalized)
+            out.append(normalized)
+
+    if len(out) == 0:
+        raise ValueError("No valid metrics were provided")
+    return out
+
+
+def _ten_db_bandwidth_hz(signal: np.ndarray, fs: int) -> float:
+    """Return 10 dB bandwidth (Hz) measured from the signal magnitude spectrum."""
+    x = np.asarray(signal, dtype=float).ravel()
+    if x.size < 2 or not np.isfinite(x).any():
+        return np.nan
+
+    x = np.nan_to_num(x, nan=0.0) - np.nanmean(x)
+    if x.size > 3:
+        x = x * np.hanning(x.size)
+
+    X = np.fft.rfft(x)
+    mag = np.abs(X)
+    if mag.size == 0:
+        return np.nan
+
+    mag_db = 20.0 * np.log10(mag + 1e-18)
+    peak_db = np.nanmax(mag_db)
+    if not np.isfinite(peak_db):
+        return np.nan
+
+    keep = mag_db >= (peak_db - 10.0)
+    if not np.any(keep):
+        return np.nan
+
+    freqs = np.fft.rfftfreq(x.size, d=1.0 / fs)
+    bw_hz = float(freqs[keep][-1] - freqs[keep][0])
+    return float(np.round(bw_hz, 1))
+
+
+def _compute_metric_values(received_signal: np.ndarray,
+                           fs: int,
+                           metric_names,
+                           precomputed_p2p_db: float | None = None) -> dict:
+    """Compute one or more metrics from a received waveform."""
+    vals = {}
+    for metric in metric_names:
+        if metric == "p2p":
+            if precomputed_p2p_db is None:
+                p2p_db = 20.0 * np.log10(np.ptp(np.real(received_signal)) + 1e-18)
+                vals[metric] = float(np.round(p2p_db, 1))
+            else:
+                vals[metric] = float(np.round(precomputed_p2p_db, 1))
+        elif metric == "dBBand10":
+            vals[metric] = _ten_db_bandwidth_hz(np.real(received_signal), fs)
+        else:
+            raise ValueError(f"Metric '{metric}' is not implemented")
+    return vals
+
+
 # ========= Coherent multi-frequency synthesis =========
 
 def thorp_alpha_db_per_km(f_hz: np.ndarray) -> np.ndarray:
@@ -324,7 +414,8 @@ def process_run(run_id: str,
                 df_hz: float = 200.0,
                 c_eff_m_s: float = 1480.0,
                 f_ref_hz: float = 35000.0,
-                arrivals_include_absorption: bool = True):
+                arrivals_include_absorption: bool = True,
+                metric_names=("p2p",)):
     """
     Worker: compute p2p outputs for one run across all depth indices present in depth_row.
     If coherent=False → legacy single-IR method.
@@ -374,7 +465,7 @@ def process_run(run_id: str,
         for d_idx in depth_idxs:
             mask = data["rx_depth_ndx"] == d_idx
             if not np.any(mask):
-                results.append((d_idx, np.nan))
+                results.append((d_idx, {m: np.nan for m in metric_names}))
                 continue
 
             hyd = {k: (v[mask] if k in data else None) for k, v in data.items()}
@@ -392,16 +483,18 @@ def process_run(run_id: str,
             #     val_db, _ = p2pArrivalSNR(hyd, segment, fs)
             
             if coherent:
-                val_db = p2pArrivalSNR_coherent_fast(
+                received = coherent_received_waveform_fast(
                     hyd, S_f=S_f, fs=fs, freqs_hz=freqs, n_time=n_time,
                     c_eff_m_s=c_eff_m_s, f_ref_hz=f_ref_hz,
                     arrivals_include_absorption=arrivals_include_absorption
                 )
+                metric_vals = _compute_metric_values(received, fs, metric_names)
             else:
-                val_db, _ = p2pArrivalSNR(hyd, segment, fs)
+                p2p_db, received = p2pArrivalSNR(hyd, segment, fs)
+                metric_vals = _compute_metric_values(received, fs, metric_names, precomputed_p2p_db=p2p_db)
                     
             
-            results.append((d_idx, val_db))
+            results.append((d_idx, metric_vals))
 
     return run_index, results
 
@@ -589,13 +682,13 @@ def CreateOutputCSVs(h5_path: str,
                     process_run, run_id, run_index, depth_row,
                     segment, samplerate, h5_path, dive_id,
                     coherent, fmin_hz, fmax_hz, df_hz, c_eff_m_s,
-                    f_ref_hz, arrivals_include_absorption
+                    f_ref_hz, arrivals_include_absorption, ("p2p",)
                 ))
 
             for fut in tqdm(futures, desc=f"Dive {dive_id}"):
                 run_index, pairs = fut.result()
-                for depth_idx, val in pairs:
-                    p2p_grid[run_index, depth_idx] = val
+                for depth_idx, metrics_out in pairs:
+                    p2p_grid[run_index, depth_idx] = metrics_out.get("p2p", np.nan)
 
         out_name = f"PeakToPeak_{dive_id}_GliderDepth_{int(round(drifter_depth))}m_{int(fmin_hz/1000)}_{int(fmax_hz/1000)}khz.csv"
         out_file = os.path.join(out_path, out_name)
@@ -617,6 +710,7 @@ def CreateOutputCSVs_long(h5_path: str,
                      nWorkers: int = 10,
                      prefer_processes: bool = False,
                      coherent: bool = False,
+                     metrics="p2p",
                      fmin_hz: float = 20000.0,
                      fmax_hz: float = 90000.0,
                      df_hz: float = 200.0,
@@ -624,17 +718,25 @@ def CreateOutputCSVs_long(h5_path: str,
                      f_ref_hz: float = 35000.0,
                      arrivals_include_absorption: bool = True):
     """
-    Build per-dive peak-to-peak CSVs in parallel over RUNS.
+        Build per-dive metric CSVs in parallel over RUNS.
 
     Also writes a LONG, vectorized CSV with columns:
-      lat, lon, drifterlat, drifterlon, range, depth_m, RL
+            lat, lon, drifterlat, drifterlon, range, depth_m, RL, ...metric columns...
     (one row per location × depth cell).
+
+        Parameters
+        ----------
+        metrics : str | list[str]
+                One metric (e.g., "p2p") or a list (e.g., ["p2p", "dBBand10"]).
     """
     if mp.current_process().name != "MainProcess":
         return
 
     os.makedirs(out_path, exist_ok=True)
     dive_ids = _enumerate_dives(h5_path)
+        metric_names = _normalize_metric_names(metrics)
+        source_dbband10_hz = _ten_db_bandwidth_hz(segment, samplerate)
+        primary_metric = metric_names[0]
 
     for dive_id in dive_ids:
         print(f"Processing dive: {dive_id}")
@@ -655,8 +757,10 @@ def CreateOutputCSVs_long(h5_path: str,
             drifter_lat = float(dive_grp.parent.attrs["start_lat"])
             drifter_lon = float(dive_grp.parent.attrs["start_lon"])
 
-        # Pre-allocate RL grid (nloc x ndep)
-        p2p_grid = np.full_like(depth_grid, np.nan, dtype=np.float64)
+        metric_grids = {
+            m: np.full_like(depth_grid, np.nan, dtype=np.float64)
+            for m in metric_names
+        }
 
         Executor, _mode = _choose_executor(prefer_processes)
         if coherent:
@@ -671,13 +775,14 @@ def CreateOutputCSVs_long(h5_path: str,
                     process_run, run_id, run_index, depth_row,
                     segment, samplerate, h5_path, dive_id,
                     coherent, fmin_hz, fmax_hz, df_hz, c_eff_m_s,
-                    f_ref_hz, arrivals_include_absorption
+                    f_ref_hz, arrivals_include_absorption, tuple(metric_names)
                 ))
 
             for fut in tqdm(futures, desc=f"Dive {dive_id}"):
                 run_index, pairs = fut.result()
-                for depth_idx, val in pairs:
-                    p2p_grid[run_index, depth_idx] = val
+                for depth_idx, metric_vals in pairs:
+                    for metric_name in metric_names:
+                        metric_grids[metric_name][run_index, depth_idx] = metric_vals.get(metric_name, np.nan)
 
         # # -----------------------------------------
         # # ORIGINAL grid dump (keep if you still want it)
@@ -691,7 +796,7 @@ def CreateOutputCSVs_long(h5_path: str,
         # -----------------------------------------
         # NEW: LONG, VECTORIZED export (location × depth)
         # -----------------------------------------
-        nloc, ndep = p2p_grid.shape
+        nloc, ndep = metric_grids[primary_metric].shape
 
         # Trim lat/lon to nloc (shape-guard)
         lat = lat[:nloc]; lon = lon[:nloc]
@@ -710,7 +815,8 @@ def CreateOutputCSVs_long(h5_path: str,
         # if a column is entirely invalid, depth will be NaN (kept, but rows get filtered below)
 
         # Flatten to long form (one row per cell)
-        RL_flat     = p2p_grid.reshape(-1)                # (nloc*ndep,)
+        metric_flat = {m: metric_grids[m].reshape(-1) for m in metric_names}
+        RL_flat     = metric_flat[primary_metric]
         lat_flat    = np.repeat(lat, ndep)
         lon_flat    = np.repeat(lon, ndep)
         range_flat  = np.repeat(range_m, ndep)
@@ -718,7 +824,7 @@ def CreateOutputCSVs_long(h5_path: str,
 
         # Keep only cells with a valid RL AND valid depth value
         valid = np.isfinite(RL_flat) & np.isfinite(depth_flat)
-        df_out = pd.DataFrame({
+        out_data = {
             "lat":         lat_flat[valid],
             "lon":         lon_flat[valid],
             "drifterlat":  np.full(valid.sum(), drifter_lat, dtype=float),
@@ -726,27 +832,36 @@ def CreateOutputCSVs_long(h5_path: str,
             "range":       range_flat[valid],
             "depth_m":     depth_flat[valid],
             "RL":          RL_flat[valid],
-        })
+            "source_dBBand10": np.full(valid.sum(), source_dbband10_hz, dtype=float),
+        }
+        for metric_name in metric_names:
+            out_data[metric_name] = metric_flat[metric_name][valid]
+        df_out = pd.DataFrame(out_data)
 
-        long_name = (f"PeakToPeak_{dive_id}_GliderDepth_{int(round(drifter_depth))}m_"
-                     f"{int(fmin_hz/1000)}_{int(fmax_hz/1000)}khz_long.csv")
+        if metric_names == ["p2p"]:
+            long_name = (f"PeakToPeak_{dive_id}_GliderDepth_{int(round(drifter_depth))}m_"
+                         f"{int(fmin_hz/1000)}_{int(fmax_hz/1000)}khz_long.csv")
+        else:
+            metric_tag = "_".join(metric_names)
+            long_name = (f"Metrics_{metric_tag}_{dive_id}_GliderDepth_{int(round(drifter_depth))}m_"
+                         f"{int(fmin_hz/1000)}_{int(fmax_hz/1000)}khz_long.csv")
         long_file = os.path.join(out_path, long_name)
         df_out.to_csv(_ensure_parent_dir(long_file), index=False)
         print(f"Saved long CSV: {long_file}  ({len(df_out):,} rows)")
 
 
-def p2pArrivalSNR_coherent_fast(arrivals: dict,
-                                S_f: np.ndarray,
-                                fs: int,
-                                freqs_hz: np.ndarray,
-                                n_time: int,
-                                c_eff_m_s: float,
-                                f_ref_hz: float,
-                                arrivals_include_absorption: bool = True):
+def coherent_received_waveform_fast(arrivals: dict,
+                                    S_f: np.ndarray,
+                                    fs: int,
+                                    freqs_hz: np.ndarray,
+                                    n_time: int,
+                                    c_eff_m_s: float,
+                                    f_ref_hz: float,
+                                    arrivals_include_absorption: bool = True):
     tau = np.asarray(arrivals.get("time_of_arrival", []), float).reshape(-1)
     amp = np.asarray(arrivals.get("arrival_amplitude", []), complex).reshape(-1)
     if tau.size == 0 or amp.size == 0:
-        return np.nan
+        return np.zeros(n_time, dtype=float)
 
     # Path length estimate (since you do not store path_length_m)
     Rm = tau * float(c_eff_m_s)
@@ -778,6 +893,28 @@ def p2pArrivalSNR_coherent_fast(arrivals: dict,
 
     # back to time: interpolate onto rFFT grid then irfft
     received = _safe_irfft_on_grid(freqs_hz, Rspec, n_time=n_time, fs=fs)
+
+    return np.real(received)
+
+
+def p2pArrivalSNR_coherent_fast(arrivals: dict,
+                                S_f: np.ndarray,
+                                fs: int,
+                                freqs_hz: np.ndarray,
+                                n_time: int,
+                                c_eff_m_s: float,
+                                f_ref_hz: float,
+                                arrivals_include_absorption: bool = True):
+    received = coherent_received_waveform_fast(
+        arrivals,
+        S_f=S_f,
+        fs=fs,
+        freqs_hz=freqs_hz,
+        n_time=n_time,
+        c_eff_m_s=c_eff_m_s,
+        f_ref_hz=f_ref_hz,
+        arrivals_include_absorption=arrivals_include_absorption,
+    )
 
     p2p_db = 20.0 * np.log10(np.ptp(np.real(received)) + 1e-18)
     return float(np.round(p2p_db, 1))
