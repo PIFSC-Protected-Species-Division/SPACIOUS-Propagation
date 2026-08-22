@@ -29,6 +29,16 @@ os.environ.update({
     "OMP_NUM_THREADS":      "1",
 })
 
+
+import ssl
+
+# Safely bypass loading corrupted Windows registry certificates
+ssl.SSLContext.load_default_certs = lambda self, purpose=ssl.Purpose.SERVER_AUTH: None
+
+import geopy
+from geopy.distance import geodesic
+
+print(f"geopy version {geopy.__version__} loaded successfully!")
 ###############################################################################
 # 2) ---- real processes, coarser chunks, no chatty prints --------------------
 from multiprocessing import Pool
@@ -38,10 +48,8 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 import numpy as np
 from geopy.distance import geodesic
 from geopy.point import Point
-from geopy.point import Point
-
 import matplotlib.pyplot as plt
-
+from geopy.point import Point
 import xarray as xr
 import pandas as pd
 from scipy.interpolate import griddata
@@ -268,6 +276,45 @@ def extract_bathymetry_from_subset_vectorized(
         )
     return bathymetry_values, lons, lats, range_km, actual_distance
 
+def sanitize_ssp_profile(profile: pd.DataFrame) -> pd.DataFrame:
+    """Return a strictly increasing SSP profile with no duplicate depths."""
+    if profile is None or profile.empty:
+        raise ValueError("SSP profile is empty.")
+
+    profile = profile.copy()
+    profile = profile[['depth', 'ss']].dropna().copy()
+    profile['depth'] = pd.to_numeric(profile['depth'], errors='coerce')
+    profile['ss'] = pd.to_numeric(profile['ss'], errors='coerce')
+    profile = profile[np.isfinite(profile['depth']) & np.isfinite(profile['ss'])].copy()
+
+    if profile.empty:
+        raise ValueError("SSP profile contains no valid depth/sound-speed pairs.")
+
+    profile = profile.sort_values('depth').reset_index(drop=True)
+
+    # Force the surface to be exactly zero, then collapse any duplicate depths by averaging.
+    if profile.iloc[0]['depth'] > 0:
+        profile.loc[0, 'depth'] = 0.0
+    profile = profile.groupby('depth', as_index=False)['ss'].mean()
+    profile = profile.sort_values('depth').reset_index(drop=True)
+
+    # Bellhop requires strictly increasing depth samples. If any duplicates remain from
+    # floating-point noise, nudge only the later values upward by a tiny epsilon.
+    for i in range(1, len(profile)):
+        if profile.iloc[i]['depth'] <= profile.iloc[i - 1]['depth']:
+            profile.at[i, 'depth'] = profile.iloc[i - 1]['depth'] + 1e-6
+
+    profile = profile.sort_values('depth').reset_index(drop=True)
+
+    if len(profile) < 2:
+        return profile
+
+    if np.any(np.diff(profile['depth']) <= 0):
+        raise ValueError("SSP profile could not be made strictly monotonic in depth.")
+
+    return profile
+
+
 def interpolate_sound_speed(dive_data, maxDepth, plot=False):
     dive_data_sorted = dive_data.sort_values('Depth_m')
     dive_data_sorted.dropna(inplace=True, subset=['SoundSpeed_m_s'])
@@ -353,16 +400,16 @@ if __name__ == "__main__":
    # Parameters for the propagaton model
    
    import matplotlib.patheffects as pe
-   propagationDepth = [50, 200, 350,500, 650, 800]
+   propagationDepth = [500]
    # Bottom Characteristics
-   Sediments = ['silt', 'gravel', 'basalt']
-   bottom_soundspeed =[1575,1800,5250]
-   bottom_density =[1700,2000,2700]
-   bottom_absorption= [1,0.6,0.1]
+   Sediments = ['silt']
+   bottom_soundspeed =[1575]
+   bottom_density =[1700]
+   bottom_absorption= [1,]
    freq_hz =12000
 
    drift_csv = r"C:\\Users\\\pam_user\\Documents\\GitHub\\SPACIOUS-Propagation-Modes\\modelling\\sg680_CalCurCEAS_Sep2024_CTD.csv"
-   gebco_nc  = r"C:\\Users\\\pam_user\\Documents\\GitHub\\SPACIOUS-Propagation-Modes\\bathymetry\\GEBCO_28_Jul_2025_937903cf24aa\\gebco_2024_n44.6_s40.2_w-126.3_e-124.0.nc"
+   gebco_nc  = r"C:\\Users\\\pam_user\\Documents\\GitHub\\SPACIOUS-Propagation-Modes\\bathymetry\\GEBCO_04_Aug_2026_51f782cc88d3\\gebco_2026_n46.0_s40.0_w-127.0_e-124.0.nc"
    driftEnds = r'C:\\Users\\\pam_user\\Documents\\GitHub\\SPACIOUS-Propagation-Modes\\modelling\\sg680_CalCurCEAS_Sep2024_final_targets_distances_withDate.csv'
    out_h5    = "X:\\Kaitlin_Palmer\\CalCurCEAS_propagation_hdf5s"
 
@@ -393,7 +440,7 @@ if __name__ == "__main__":
    lons = driftEnds['lon'].values
    
    # The dives we want
-   ends = [13,5,21]
+   ends = [0,1,2,3,4, 5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20, 21,22,23 ,24,25,26]
    end_dive_nums = driftEnds['closestDive'][ends]
    
    # Create a subset of the dives
@@ -460,13 +507,18 @@ if __name__ == "__main__":
                 group = driftCTD[driftCTD['DiveID'] == dive_id]
                 
                 
-                # Determine if the glider is ascending or descending
-                depth_diff = np.diff(group['Depth_m'], prepend=np.nan)
-                group['Direction'] = np.where(depth_diff > 0, 'dec', 'asc')
-                if depth_diff[1] > 0:
-                    group.at[0, 'Direction'] = 'dec'
-                else:
-                    group.at[0, 'Direction'] = 'asc'
+                # 1. Ensure 'group' is an explicit copy if it came from a groupby operation
+                group = group.copy()
+                
+                # 2. Compute depth differences
+                depth_diff = np.diff(group["Depth_m"], prepend=np.nan)
+                
+                # 3. Assign the 'Direction' column safely using assignment
+                group["Direction"] = np.where(depth_diff > 0, "dec", "asc")
+                
+                # 4. Use .loc to modify individual elements safely
+                first_dir = "dec" if depth_diff[1] > 0 else "asc"
+                group.loc[group.index[0], "Direction"] = first_dir
                 
                 print(dive_id)
                 diveName = 'dive_'+dive_id
@@ -484,15 +536,11 @@ if __name__ == "__main__":
                     drifter_depth = depth
                
                 
-                # Create the SSP profile
+                # Create the SSP profile and collapse duplicate depths before handing it to Bellhop.
                 profile = pd.DataFrame({
                     'depth': group['Depth_m'],
                     'ss':    group['SoundSpeed_m_s'] })
-                ()
-                profile.sort_values('depth', inplace=True)
-                profile.dropna(inplace=True)
-                profile.reset_index(drop=True, inplace=True)
-                profile.loc[0, 'depth'] = 0
+                profile = sanitize_ssp_profile(profile)
                 
                 # Only use the dive if the profile depth is more than 200m
                 if np.max(profile['depth'])>depth:
@@ -549,10 +597,10 @@ if __name__ == "__main__":
                                                 len(np.arange(profile.iloc[-1]['depth']+10, max_depth+50, step =50)))})
                         
                         
-                        profile = pd.concat([profile, expanedProfile])
+                        profile = pd.concat([profile, expanedProfile], ignore_index=True)
+                        profile = sanitize_ssp_profile(profile)
                         profile['ss'] = np.abs(profile['ss'])
-                        profile.sort_values('depth', inplace=True)
-                        ssp = profile.apply(lambda row: [row['depth'], row['ss']], axis=1).tolist()
+                        ssp = [[float(row['depth']), float(row['ss'])] for _, row in profile.iterrows()]
                         
                         
                         # Dictionary with keys 'start_lat', 'start_lon', and 'drifter_depth'.

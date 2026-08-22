@@ -77,6 +77,10 @@ os.chdir('X:\\Kaitlin_Palmer\\CalCurCEAS_propagation_hdf5s\\')
 result = glob.glob('*.{}'.format('h5'))
 print(result)
 
+# One metric string ("p2p") or a list (e.g., ["p2p", "dBBand10"]).
+export_metrics = ["p2p"]
+
+
 for h5file in result:
     hfLoc = (os.path.join('X:\\Kaitlin_Palmer\\CalCurCEAS_propagation_hdf5s\\',
                        h5file))
@@ -94,8 +98,9 @@ for h5file in result:
         segment=click_waveform,                 # 1-D np.ndarray
         samplerate=samplerate,
         out_path=out_path,
+        metrics=export_metrics,
         coherent=False,
-        nWorkers=60,
+        nWorkers=3,
         f_ref_hz =35000,
         prefer_processes=False,           # threads are safer on Windows top-level
         fmin_hz=1000, 

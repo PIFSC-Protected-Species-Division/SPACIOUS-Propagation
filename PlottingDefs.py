@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import os
 import sys
+from functools import lru_cache
 import numpy as np
 import h5py
 import pandas as pd
@@ -19,7 +20,9 @@ import matplotlib.pyplot as plt
 from matplotlib import cm
 from mpl_toolkits.mplot3d.art3d import Poly3DCollection
 from scipy.interpolate import griddata, NearestNDInterpolator
+from scipy.io import wavfile
 from scipy.ndimage import gaussian_filter
+from scipy.signal import resample_poly
 from skimage import measure
 from geopy.distance import geodesic
 from pyproj import Transformer, Geod
@@ -96,11 +99,51 @@ def _geo_range_m_array(drifter_lat: float,
     _, _, dist_m = geod.inv(lon1, lat1, lon_vec.astype(float), lat_vec.astype(float))
     return dist_m.astype(float)
 
+def _coerce_waveform_to_1d(waveform) -> np.ndarray:
+    """Convert a waveform-like array to a 1-D mono signal before analysis."""
+    arr = np.asarray(waveform, dtype=float)
+    if arr.ndim == 0:
+        return np.asarray([float(arr)], dtype=float)
+
+    if arr.ndim > 1:
+        if arr.shape[0] <= 4 and arr.shape[0] <= arr.shape[1]:
+            arr = np.mean(arr, axis=0)
+        else:
+            arr = np.mean(arr, axis=1)
+
+    return np.nan_to_num(arr.astype(float, copy=False)).reshape(-1)
+
+
+def load_click_waveform(wav_path, target_fs_hz):
+    """Load a click waveform with the same logic as Test.py."""
+    fs, audio = wavfile.read(wav_path)
+    audio = np.asarray(audio)
+
+    if np.issubdtype(audio.dtype, np.integer):
+        scale = max(abs(np.iinfo(audio.dtype).min), np.iinfo(audio.dtype).max)
+        audio = audio.astype(np.float64) / float(scale)
+    else:
+        audio = audio.astype(np.float64)
+
+    if audio.ndim > 1:
+        audio = np.mean(audio, axis=1)
+
+    if fs != target_fs_hz:
+        gcd = int(np.gcd(int(fs), int(target_fs_hz)))
+        up = int(target_fs_hz // gcd)
+        down = int(fs // gcd)
+        audio = resample_poly(audio, up, down)
+        fs = target_fs_hz
+
+    return audio.astype(float, copy=False), int(fs)
+
+
 def scaleP2P(segment: np.ndarray, outP2P: float = 220.0) -> np.ndarray:
     """Scale 'segment' so its peak-to-peak is 'outP2P' dB (re linear units)."""
-    init_p2pdB = 20.0 * np.log10(np.ptp(segment) + 1e-18)
+    mono = _coerce_waveform_to_1d(segment)
+    init_p2pdB = 20.0 * np.log10(np.ptp(mono) + 1e-18)
     gain = 10 ** ((outP2P - init_p2pdB) / 20.0)
-    return segment * gain
+    return mono * gain
 
 def arrivals_to_impulse_response(arrivals: dict, fs: int, abs_time: bool = False) -> np.ndarray:
     """Convert sparse arrivals (toa, amp) into a complex-valued impulse response."""
@@ -175,54 +218,625 @@ def _normalize_metric_names(metrics):
     return out
 
 
-def _ten_db_bandwidth_hz(signal: np.ndarray, fs: int) -> float:
-    """Return 10 dB bandwidth (Hz) measured from the signal magnitude spectrum."""
+import numpy as np
+
+
+def _energy_window_bounds(signal, energy_fraction=0.90):
+    """Return sample bounds for the central energy_fraction of a signal's energy."""
     x = np.asarray(signal, dtype=float).ravel()
-    if x.size < 2 or not np.isfinite(x).any():
-        return np.nan
+    if x.size == 0:
+        return 0, 0
 
-    x = np.nan_to_num(x, nan=0.0) - np.nanmean(x)
-    if x.size > 3:
-        x = x * np.hanning(x.size)
+    x = np.nan_to_num(x, nan=0.0)
+    energy = x * x
+    total = float(np.sum(energy))
+    if total <= 0.0:
+        return 0, x.size
 
-    X = np.fft.rfft(x)
-    mag = np.abs(X)
-    if mag.size == 0:
-        return np.nan
-
-    mag_db = 20.0 * np.log10(mag + 1e-18)
-    peak_db = np.nanmax(mag_db)
-    if not np.isfinite(peak_db):
-        return np.nan
-
-    keep = mag_db >= (peak_db - 10.0)
-    if not np.any(keep):
-        return np.nan
-
-    freqs = np.fft.rfftfreq(x.size, d=1.0 / fs)
-    bw_hz = float(freqs[keep][-1] - freqs[keep][0])
-    return float(np.round(bw_hz, 1))
+    frac = float(np.clip(energy_fraction, 1e-6, 1.0))
+    tail = 0.5 * (1.0 - frac)
+    cume = np.cumsum(energy) / total
+    start = int(np.searchsorted(cume, tail, side="left"))
+    stop = int(np.searchsorted(cume, 1.0 - tail, side="left")) + 1
+    stop = max(stop, start + 1)
+    return start, min(stop, x.size)
 
 
-def _compute_metric_values(received_signal: np.ndarray,
-                           fs: int,
-                           metric_names,
-                           precomputed_p2p_db: float | None = None) -> dict:
-    """Compute one or more metrics from a received waveform."""
-    vals = {}
+def _scaled_energy_window_samples(signal, energy_fraction=0.90, scale=3.0):
+    """Return a source-derived direct-arrival window length in samples."""
+    start, stop = _energy_window_bounds(signal, energy_fraction=energy_fraction)
+    width = max(1, int(stop - start))
+    return max(1, int(np.ceil(float(scale) * width)))
+
+
+def _slice_direct_arrival_window(signal, window_samples):
+    """Return the leading direct-arrival time window from an aligned received signal."""
+    if window_samples is None:
+        return np.asarray(signal)
+    n = max(1, int(window_samples))
+    return np.asarray(signal)[:n]
+
+
+def _apply_arrival_delay_filter(arrivals, max_arrival_delay_s=None):
+    """Filter arrivals so only those within the max delay of the earliest arrival remain."""
+    if max_arrival_delay_s is None:
+        return arrivals
+
+    arrivals = dict(arrivals)
+    tau = np.asarray(arrivals.get("time_of_arrival", []), dtype=float).reshape(-1)
+    if tau.size == 0:
+        return arrivals
+
+    earliest_tau = float(np.min(tau))
+    keep = tau <= earliest_tau + float(max_arrival_delay_s)
+    for key, value in list(arrivals.items()):
+        if key == "time_of_arrival":
+            continue
+        if isinstance(value, np.ndarray):
+            arrivals[key] = value[keep]
+        elif isinstance(value, list):
+            arrivals[key] = [v for v, k in zip(value, keep) if k]
+        elif hasattr(value, "__len__") and not isinstance(value, (str, bytes)):
+            try:
+                arrivals[key] = np.asarray(value)[keep]
+            except Exception:
+                pass
+    arrivals["time_of_arrival"] = tau[keep]
+    return arrivals
+
+
+def _next_power_of_two(value):
+    """Return the smallest power of two greater than or equal to value."""
+    value = int(value)
+    if value < 1:
+        return 1
+    return 1 << int(np.ceil(np.log2(value)))
+
+
+@lru_cache(maxsize=64)
+def _get_hann_window(window_samples):
+    """Cache the Hann window for a fixed window size."""
+    return np.hanning(int(window_samples))
+
+
+@lru_cache(maxsize=128)
+def _get_rfft_frequencies(n_fft, sampling_rate_hz):
+    """Cache rFFT frequency bins for a fixed FFT length and sampling rate."""
+    return np.fft.rfftfreq(int(n_fft), d=1.0 / float(sampling_rate_hz))
+
+
+@lru_cache(maxsize=32)
+def _get_smoothing_kernel(smoothing_bins):
+    """Cache the smoothing kernel for a fixed smoothing width."""
+    effective_bins = int(smoothing_bins)
+    if effective_bins <= 1:
+        return None
+    if effective_bins % 2 == 0:
+        effective_bins += 1
+    return np.ones(effective_bins, dtype=float) / effective_bins
+
+
+def _smooth_linear_spectrum(values, smoothing_bins=1):
+    """Apply an optional centered moving average in linear spectral units."""
+    values = np.asarray(values, dtype=float)
+    smoothing_bins = int(smoothing_bins)
+
+    if smoothing_bins <= 1:
+        return values.copy()
+
+    if smoothing_bins % 2 == 0:
+        smoothing_bins += 1
+
+    half_width = smoothing_bins // 2
+    padded = np.pad(values, pad_width=half_width, mode="edge")
+    kernel = np.ones(smoothing_bins, dtype=float) / smoothing_bins
+    return np.convolve(padded, kernel, mode="valid")
+
+
+def calculate_10db_bandwidth(signal, fs, search_range_hz=(1_000.0, 24_000.0), db_drop=10.0, use_hann=True, smoothing_bins=1):
+    """Calculate the 10 dB bandwidth of a waveform using the PAMGuard-style method."""
+    result = compute_pamguard_bandwidth_metrics(
+        waveform=signal,
+        sampling_rate_hz=fs,
+        click_samples=max(2, len(np.asarray(signal, dtype=float).ravel())),
+        pre_peak_fraction=0.25,
+        search_range_hz=search_range_hz,
+        db_drop=db_drop,
+        use_hann=use_hann,
+        smoothing_bins=smoothing_bins,
+    )
+    return float(result["bandwidth_hz"]), float(result["f_low_hz"]), float(result["f_high_hz"])
+
+
+def extract_fixed_click_window(waveform, window_samples, pre_peak_fraction=0.25):
+    """Extract a fixed-length click window around the largest absolute sample."""
+    waveform = _coerce_waveform_to_1d(waveform)
+
+    if waveform.size == 0:
+        raise ValueError("The source waveform is empty.")
+
+    window_samples = int(window_samples)
+    if window_samples < 2:
+        raise ValueError("window_samples must be at least 2.")
+
+    if not 0.0 <= pre_peak_fraction <= 1.0:
+        raise ValueError("pre_peak_fraction must be between 0 and 1.")
+
+    peak_index = int(np.argmax(np.abs(waveform)))
+    pre_peak_samples = int(round(window_samples * pre_peak_fraction))
+    source_start = peak_index - pre_peak_samples
+    source_end = source_start + window_samples
+
+    click_window = np.zeros(window_samples, dtype=float)
+    valid_source_start = max(0, source_start)
+    valid_source_end = min(waveform.size, source_end)
+    destination_start = valid_source_start - source_start
+    destination_end = destination_start + (valid_source_end - valid_source_start)
+
+    if valid_source_end > valid_source_start:
+        click_window[destination_start:destination_end] = waveform[valid_source_start:valid_source_end]
+
+    return click_window, peak_index
+
+
+def _compute_pamguard_bandwidth_core(
+    click_waveform,
+    sampling_rate_hz,
+    search_range_hz=(1_000.0, 24_000.0),
+    db_drop=10.0,
+    use_hann=True,
+    smoothing_bins=1,
+    include_spectrum=False,
+):
+    """Compute the PAMGuard-style bandwidth metric with optional spectrum output."""
+    click_waveform = _coerce_waveform_to_1d(click_waveform)
+
+    click_waveform = np.nan_to_num(click_waveform)
+
+    if click_waveform.size < 2:
+        raise ValueError("The click waveform must contain at least two samples.")
+
+    n_fft = _next_power_of_two(click_waveform.size)
+
+    if use_hann:
+        fft_input = click_waveform * _get_hann_window(click_waveform.size)
+    else:
+        fft_input = click_waveform.copy()
+
+    fft_values = np.fft.rfft(fft_input, n=n_fft)
+    magnitude = np.abs(fft_values)
+    frequencies_hz = _get_rfft_frequencies(n_fft, sampling_rate_hz)
+
+    magnitude = magnitude[:n_fft // 2]
+    frequencies_hz = frequencies_hz[:n_fft // 2]
+    magnitude_for_width = _smooth_linear_spectrum(magnitude, smoothing_bins=smoothing_bins)
+
+    search_low_hz, search_high_hz = search_range_hz
+    search_indices = np.flatnonzero((frequencies_hz >= search_low_hz) & (frequencies_hz <= search_high_hz))
+    if search_indices.size == 0:
+        raise ValueError("No FFT bins fall inside the requested peak-search range.")
+
+    peak_index = search_indices[np.argmax(magnitude_for_width[search_indices])]
+    peak_magnitude = magnitude_for_width[peak_index]
+    if peak_magnitude <= 0:
+        raise ValueError("The spectral peak has zero magnitude.")
+
+    threshold_magnitude = peak_magnitude / 10.0 ** (db_drop / 20.0)
+
+    low_index = peak_index
+    high_index = peak_index
+    while low_index > search_indices[0] and magnitude_for_width[low_index] > threshold_magnitude:
+        low_index -= 1
+    while high_index < search_indices[-1] and magnitude_for_width[high_index] > threshold_magnitude:
+        high_index += 1
+
+    f_low_hz = frequencies_hz[low_index]
+    f_high_hz = frequencies_hz[high_index]
+    bandwidth_hz = f_high_hz - f_low_hz
+
+    if not include_spectrum:
+        return {
+            "bandwidth_hz": float(bandwidth_hz),
+            "f_low_hz": float(f_low_hz),
+            "f_high_hz": float(f_high_hz),
+            "peak_frequency_hz": float(frequencies_hz[peak_index]),
+        }
+
+    return {
+        "bandwidth_hz": float(bandwidth_hz),
+        "f_low_hz": float(f_low_hz),
+        "f_high_hz": float(f_high_hz),
+        "peak_frequency_hz": float(frequencies_hz[peak_index]),
+        "peak_index": int(peak_index),
+        "low_index": int(low_index),
+        "high_index": int(high_index),
+        "threshold_magnitude": float(threshold_magnitude),
+        "frequencies_hz": frequencies_hz,
+        "raw_magnitude": magnitude,
+        "magnitude_for_width": magnitude_for_width,
+        "n_fft": int(n_fft),
+    }
+
+
+def _is_effectively_monochromatic_spectrum(spectrum, peak_index):
+    """Return True when a single spectral line dominates the spectrum."""
+    spectrum = np.asarray(spectrum, dtype=float).reshape(-1)
+    if spectrum.size < 3:
+        return False
+
+    peak_magnitude = float(spectrum[peak_index])
+    if peak_magnitude <= 0.0:
+        return False
+
+    other_magnitudes = np.delete(spectrum, peak_index)
+    if other_magnitudes.size == 0:
+        return False
+
+    median_other = float(np.median(other_magnitudes))
+    if median_other <= 0.0:
+        return True
+
+    return peak_magnitude / median_other >= 50.0
+
+def next_power_of_two(value):
+    """Return the smallest power of two greater than or equal to value."""
+    value = int(value)
+
+    if value < 1:
+        return 1
+
+    return 1 << int(np.ceil(np.log2(value)))
+
+
+def smooth_linear_spectrum(values, smoothing_bins=1):
+    """
+    Apply an optional centered moving average in linear spectral units.
+
+    A value of 1 performs no smoothing.
+    """
+    values = np.asarray(values, dtype=float)
+    smoothing_bins = int(smoothing_bins)
+
+    if smoothing_bins <= 1:
+        return values.copy()
+
+    # Use an odd window so that smoothing is centered.
+    if smoothing_bins % 2 == 0:
+        smoothing_bins += 1
+
+    half_width = smoothing_bins // 2
+
+    padded = np.pad(
+        values,
+        pad_width=half_width,
+        mode="edge",
+    )
+
+    kernel = (
+        np.ones(smoothing_bins, dtype=float)
+        / smoothing_bins
+    )
+
+    return np.convolve(
+        padded,
+        kernel,
+        mode="valid",
+    )
+
+def calculate_pamguard_style_bandwidth(
+    click_waveform,
+    sampling_rate_hz,
+    search_range_hz=(1_000.0, 24_000.0),
+    db_drop=10.0,
+    use_hann=True,
+    smoothing_bins=1,
+):
+    """
+    Calculate a discrete-bin PAMGuard-style peak-frequency width.
+
+    Processing:
+      1. FFT length is the smallest power of two containing the click.
+      2. A Hann window is optionally applied to the complete saved click.
+      3. FFT magnitude is calculated.
+      4. The largest bin inside the search range is selected.
+      5. The search moves outward until the magnitude is at least 10 dB
+         below the peak.
+      6. No interpolation is performed between FFT bins.
+
+    smoothing_bins=1 gives the raw single-channel result. Larger values are
+    included only as a diagnostic for classifier-style spectral smoothing.
+    """
+    click_waveform = np.asarray(
+        click_waveform,
+        dtype=float,
+    ).reshape(-1)
+
+    click_waveform = np.nan_to_num(click_waveform)
+
+    if click_waveform.size < 2:
+        raise ValueError(
+            "The click waveform must contain at least two samples."
+        )
+
+    n_fft = next_power_of_two(click_waveform.size)
+
+    if use_hann:
+        fft_input = (
+            click_waveform
+            * np.hanning(click_waveform.size)
+        )
+    else:
+        fft_input = click_waveform.copy()
+
+    fft_values = np.fft.rfft(
+        fft_input,
+        n=n_fft,
+    )
+
+    magnitude = np.abs(fft_values)
+
+    frequencies_hz = np.fft.rfftfreq(
+        n_fft,
+        d=1.0 / sampling_rate_hz,
+    )
+
+    # Exclude the Nyquist bin for closer correspondence with the usual
+    # half-spectrum representation.
+    magnitude = magnitude[:n_fft // 2]
+    frequencies_hz = frequencies_hz[:n_fft // 2]
+
+    magnitude_for_width = smooth_linear_spectrum(
+        magnitude,
+        smoothing_bins=smoothing_bins,
+    )
+
+    search_low_hz, search_high_hz = search_range_hz
+
+    search_indices = np.flatnonzero(
+        (frequencies_hz >= search_low_hz)
+        & (frequencies_hz <= search_high_hz)
+    )
+
+    if search_indices.size == 0:
+        raise ValueError(
+            "No FFT bins fall inside the requested peak-search range."
+        )
+
+    peak_index = search_indices[
+        np.argmax(
+            magnitude_for_width[search_indices]
+        )
+    ]
+
+    peak_magnitude = magnitude_for_width[peak_index]
+
+    if peak_magnitude <= 0:
+        f_low_hz = float('nan')
+        f_high_hz = float('nan')
+        bandwidth_hz = float('nan')
+    else:
+
+        # A 10 dB amplitude reduction corresponds to division by 10^(10/20).
+        threshold_magnitude = (
+            peak_magnitude
+            / 10.0 ** (db_drop / 20.0)
+        )
+    
+        low_index = peak_index
+        high_index = peak_index
+    
+        while (
+            low_index > search_indices[0]
+            and magnitude_for_width[low_index] > threshold_magnitude
+        ):
+            low_index -= 1
+    
+        while (
+            high_index < search_indices[-1]
+            and magnitude_for_width[high_index] > threshold_magnitude
+        ):
+            high_index += 1
+    
+        f_low_hz = frequencies_hz[low_index]
+        f_high_hz = frequencies_hz[high_index]
+        bandwidth_hz = f_high_hz - f_low_hz
+
+    return {
+        "bandwidth_hz": float(bandwidth_hz),
+        "f_low_hz": float(f_low_hz),
+        "f_high_hz": float(f_high_hz),
+        "peak_frequency_hz": float(
+            frequencies_hz[peak_index]
+        ),
+        "peak_index": int(peak_index),
+        "low_index": int(low_index),
+        "high_index": int(high_index),
+        "threshold_magnitude": float(threshold_magnitude),
+        "frequencies_hz": frequencies_hz,
+        "raw_magnitude": magnitude,
+        "magnitude_for_width": magnitude_for_width,
+        "n_fft": int(n_fft),
+    }
+
+
+
+def compute_pamguard_bandwidth_metrics(
+    waveform,
+    sampling_rate_hz,
+    click_samples=512,
+    pre_peak_fraction=0.25,
+    search_range_hz=(1_000.0, 24_000.0),
+    db_drop=10.0,
+    use_hann=True,
+    smoothing_bins=5,
+    include_spectrum=True,
+):
+    """
+    Extract a fixed peak-centred click and calculate its PAMGuard-style
+    discrete-bin bandwidth.
+    """
+
+    click_clip, waveform_peak_index = extract_fixed_click_window(
+        waveform=waveform,
+        window_samples=click_samples,
+        pre_peak_fraction=pre_peak_fraction,
+    )
+
+    result = calculate_pamguard_style_bandwidth(
+        click_waveform=click_clip,
+        sampling_rate_hz=sampling_rate_hz,
+        search_range_hz=search_range_hz,
+        db_drop=db_drop,
+        use_hann=use_hann,
+        smoothing_bins=smoothing_bins,
+    )
+
+    if not include_spectrum:
+        result = {
+            "bandwidth_hz": result["bandwidth_hz"],
+            "f_low_hz": result["f_low_hz"],
+            "f_high_hz": result["f_high_hz"],
+            "peak_frequency_hz": result["peak_frequency_hz"],
+        }
+
+    result["click_clip"] = click_clip
+    result["waveform_peak_index"] = int(waveform_peak_index)
+
+    return result
+
+
+
+
+def plot_source_bandwidth_diagnostic(
+    source_click,
+    source_fs,
+    out_dir,
+    click_samples=512,
+    pre_peak_fraction=0.25,
+    search_range_hz=(1_000.0, 24_000.0),
+    db_drop=10.0,
+    use_hann=True,
+    smoothing_bins=1,
+):
+    """Plot and save the source spectrum used by the receiver bandwidth metric."""
+    result = compute_pamguard_bandwidth_metrics(
+        waveform=source_click,
+        sampling_rate_hz=source_fs,
+        click_samples=click_samples,
+        pre_peak_fraction=pre_peak_fraction,
+        search_range_hz=search_range_hz,
+        db_drop=db_drop,
+        use_hann=use_hann,
+        smoothing_bins=smoothing_bins,
+    )
+
+    magnitude = result["magnitude_for_width"]
+    magnitude_db = 20.0 * np.log10(np.maximum(magnitude, np.finfo(float).tiny))
+    magnitude_db -= np.nanmax(magnitude_db)
+
+    os.makedirs(out_dir, exist_ok=True)
+    fig, ax = plt.subplots(figsize=(12, 5))
+    ax.plot(
+        result["frequencies_hz"] / 1000.0,
+        magnitude_db,
+        linewidth=1.2,
+        label=(f"Smoothed magnitude spectrum ({smoothing_bins} bins)"),
+    )
+    ax.axhline(-db_drop, linestyle="--", linewidth=1.2, label=f"-{db_drop:g} dB")
+    ax.axvline(result["f_low_hz"] / 1000.0, linestyle=":", linewidth=1.5, label="10 dB limits")
+    ax.axvline(result["f_high_hz"] / 1000.0, linestyle=":", linewidth=1.5)
+    ax.axvline(result["peak_frequency_hz"] / 1000.0, linestyle="-.", linewidth=1.2, label="Spectral peak")
+
+    upper_hz = min(search_range_hz[1], source_fs / 2.0)
+    ax.set_xlim(search_range_hz[0] / 1000.0, upper_hz / 1000.0)
+    ax.set_ylim(-50, 3)
+    ax.set_xlabel("Frequency (kHz)")
+    ax.set_ylabel("Magnitude relative to peak (dB)")
+    ax.set_title(
+        "Source click: "
+        f"{db_drop:g} dB bandwidth = {result['bandwidth_hz'] / 1000.0:.2f} kHz"
+    )
+    ax.legend()
+
+    fig.tight_layout()
+    out_png = os.path.join(out_dir, "source_click_10dB_bandwidth.png")
+    fig.savefig(out_png, dpi=200)
+    plt.close(fig)
+    return out_png
+
+
+def _compute_metric_values(
+    received_signal: np.ndarray,
+    fs: int,
+    metric_names,
+    precomputed_p2p_db: float | None = None,
+    dbband10_window_samples: int | None = None,
+    dbband10_search_range_hz=(1_000.0, 24_000.0),
+    dbband10_db_drop=10.0,
+    dbband10_use_hann=True,
+    dbband10_smoothing_bins=5,
+    click_samples=512,
+    pre_peak_fraction=0.25,
+) -> dict:
+    """
+    Compute requested metrics from one received waveform.
+
+    The dBBand10 branch uses the same extraction and spectral logic as the
+    source-click bandwidth calculation.
+    """
+
+    received_signal = _coerce_waveform_to_1d(
+        np.real(received_signal)
+    )
+
+    values = {}
+
     for metric in metric_names:
+
         if metric == "p2p":
             if precomputed_p2p_db is None:
-                p2p_db = 20.0 * np.log10(np.ptp(np.real(received_signal)) + 1e-18)
-                vals[metric] = float(np.round(p2p_db, 1))
+                p2p_db = 20.0 * np.log10(
+                    np.ptp(received_signal) + 1e-18
+                )
             else:
-                vals[metric] = float(np.round(precomputed_p2p_db, 1))
-        elif metric == "dBBand10":
-            vals[metric] = _ten_db_bandwidth_hz(np.real(received_signal), fs)
-        else:
-            raise ValueError(f"Metric '{metric}' is not implemented")
-    return vals
+                p2p_db = float(precomputed_p2p_db)
 
+            values["p2p"] = float(np.round(p2p_db, 1))
+
+        elif metric == "dBBand10":
+
+            # None means use the complete received waveform, matching the toy
+            # workflow before peak-centred extraction.
+            if dbband10_window_samples is None:
+                bandwidth_signal = received_signal
+            else:
+                bandwidth_signal = _slice_direct_arrival_window(
+                    received_signal,
+                    dbband10_window_samples,
+                )
+
+            bandwidth_result = compute_pamguard_bandwidth_metrics(
+                waveform=bandwidth_signal,
+                sampling_rate_hz=fs,
+                click_samples=click_samples,
+                pre_peak_fraction=pre_peak_fraction,
+                search_range_hz=dbband10_search_range_hz,
+                db_drop=dbband10_db_drop,
+                use_hann=dbband10_use_hann,
+                smoothing_bins=dbband10_smoothing_bins,
+                include_spectrum=False,
+            )
+
+            values["dBBand10"] = float(
+                bandwidth_result["bandwidth_hz"]
+            )
+
+        else:
+            raise ValueError(
+                f"Metric '{metric}' is not implemented."
+            )
+
+    return values
 
 # ========= Coherent multi-frequency synthesis =========
 
@@ -353,7 +967,78 @@ def _p2p_spherical_absorption_for_R(segment: np.ndarray,
 #     p2p_db = 20.0 * np.log10(np.ptp(np.real(r)) + 1e-18)
 #     return float(np.round(p2p_db, 1)), np.real(r)
 
+def compute_transfer_function_on_fft_grid(
+    arrivals,
+    fft_freqs_hz,
+    f_ref_hz,
+    synthesis_fmin_hz,
+    synthesis_fmax_hz,
+    c_eff_m_s=1480.0,
+    arrivals_include_absorption=True,
+):
+    """Construct the coherent transfer function on the native rFFT grid."""
+    tau = np.asarray(arrivals["time_of_arrival"], dtype=float).reshape(-1)
+    amp = np.asarray(arrivals["arrival_amplitude"], dtype=complex).reshape(-1)
 
+    transfer = np.zeros_like(fft_freqs_hz, dtype=np.complex128)
+    if tau.size == 0 or amp.size == 0:
+        return transfer
+    if tau.size != amp.size:
+        raise ValueError("Arrival-time and arrival-amplitude arrays differ in length.")
+
+    tau_rel = tau - np.min(tau)
+
+    if arrivals.get("path_length_m") is not None:
+        path_length_m = np.asarray(
+            arrivals["path_length_m"], dtype=float
+        ).reshape(-1)
+    else:
+        path_length_m = tau * float(c_eff_m_s)
+
+    active = (
+        (fft_freqs_hz >= float(synthesis_fmin_hz))
+        & (fft_freqs_hz <= float(synthesis_fmax_hz))
+    )
+    active_freqs = fft_freqs_hz[active]
+    if active_freqs.size == 0:
+        return transfer
+
+    alpha_db_per_km = thorp_alpha_db_per_km(active_freqs)
+    alpha_ref_db_per_km = float(
+        thorp_alpha_db_per_km(np.array([f_ref_hz], dtype=float))[0]
+    )
+
+    if arrivals_include_absorption:
+        delta_db_per_km = alpha_db_per_km - alpha_ref_db_per_km
+    else:
+        delta_db_per_km = alpha_db_per_km
+
+    delta_np_per_m = (
+        (delta_db_per_km / 20.0)
+        * np.log(10.0)
+        / 1000.0
+    )
+
+    active_transfer = np.zeros(active_freqs.size, dtype=np.complex128)
+    for arrival_index in range(tau_rel.size):
+        absorption = np.exp(
+            -delta_np_per_m * path_length_m[arrival_index]
+        )
+        phase = np.exp(
+            -1j
+            * 2.0
+            * np.pi
+            * active_freqs
+            * tau_rel[arrival_index]
+        )
+        active_transfer += (
+            amp[arrival_index]
+            * absorption
+            * phase
+        )
+
+    transfer[active] = active_transfer
+    return transfer
 def p2pArrivalSNR_coherent(arrivals: dict,
                            segment: np.ndarray,
                            fs: int,
@@ -362,34 +1047,56 @@ def p2pArrivalSNR_coherent(arrivals: dict,
                            c_eff_m_s: float = 1480.0,
                            f_ref_hz: float = 35000.0,
                            arrivals_include_absorption: bool = True):
-
     tau = np.asarray(arrivals.get("time_of_arrival", []), float).reshape(-1)
-    amp = np.asarray(arrivals.get("arrival_amplitude", [])).reshape(-1)
-    if tau.size == 0 or amp.size == 0:
+    if tau.size == 0:
         return np.nan, np.zeros_like(segment)
 
-    # --- pick a synthesis length that covers signal + delay spread ---
-    delay_span = float(np.max(tau) - np.min(tau)) if tau.size else 0.0
-    n_signal   = len(segment)
-    n_extra    = int(np.ceil(delay_span * fs)) + 1
-    n_time     = 1 << int(np.ceil(np.log2(n_signal + n_extra)))  # next pow2
-
-    # Map S(f) to grid on the chosen n_time
-    S_rfft = np.fft.rfft(segment, n=n_time)
-    f_rfft = np.fft.rfftfreq(n_time, d=1.0/fs)
-    S_f = np.interp(freqs_hz, f_rfft, np.real(S_rfft), left=0.0, right=0.0) \
-        + 1j*np.interp(freqs_hz, f_rfft, np.imag(S_rfft), left=0.0, right=0.0)
-
-    # ... (alpha setup unchanged)
-
-    # build H(f) as before (unchanged math)
-    # H_f = Σ_i [ amp[i] * exp(-Δα(f) * R_i) * exp(-j 2π f τ_i) ]
-
-    # IFFT back without trimming to len(segment)
-    Rspec = S_f * H_f
-    received = _safe_irfft_on_grid(freqs_hz, Rspec, n_time=n_time, fs=fs)
+    S_f, n_time = _precompute_source_on_grid(segment, fs, freqs_hz, tau)
+    received = coherent_received_waveform_fast(
+        arrivals,
+        S_f=S_f,
+        fs=fs,
+        freqs_hz=freqs_hz,
+        n_time=n_time,
+        c_eff_m_s=c_eff_m_s,
+        f_ref_hz=f_ref_hz,
+        arrivals_include_absorption=arrivals_include_absorption,
+    )
     p2p_db = 20.0 * np.log10(np.ptp(np.real(received)) + 1e-18)
     return float(np.round(p2p_db, 1)), np.real(received)
+
+def synthesize_received_waveform(
+    arrivals,
+    source_fft,
+    fft_freqs_hz,
+    fs,
+    n_time,
+    f_ref_hz,
+    synthesis_fmin_hz,
+    synthesis_fmax_hz,
+    c_eff_m_s=1480.0,
+):
+    """Synthesize one received click directly on the native rFFT grid."""
+    impulse_response = arrivals_to_impulse_response(
+        arrivals,
+        fs=fs,
+        abs_time=False,
+    )
+
+    transfer_function = compute_transfer_function_on_fft_grid(
+        arrivals=arrivals,
+        fft_freqs_hz=fft_freqs_hz,
+        f_ref_hz=f_ref_hz,
+        synthesis_fmin_hz=synthesis_fmin_hz,
+        synthesis_fmax_hz=synthesis_fmax_hz,
+        c_eff_m_s=c_eff_m_s,
+        arrivals_include_absorption=True,
+    )
+
+    received_fft = source_fft * transfer_function
+    received = np.fft.irfft(received_fft, n=n_time)
+
+    return np.real(received), impulse_response, transfer_function
 
 # =============================================================================
 # Parallel CSV building
@@ -401,100 +1108,302 @@ def _enumerate_dives(h5_path: str):
         return list(hf["drift_01"].keys())
     
 
-def process_run(run_id: str,
-                run_index: int,
-                depth_row: np.ndarray,
-                segment: np.ndarray,
-                fs: int,
-                h5_path: str,
-                dive_id: str,
-                coherent: bool = False,
-                fmin_hz: float = 20000.0,
-                fmax_hz: float = 90000.0,
-                df_hz: float = 200.0,
-                c_eff_m_s: float = 1480.0,
-                f_ref_hz: float = 35000.0,
-                arrivals_include_absorption: bool = True,
-                metric_names=("p2p",)):
+def process_run(
+    run_id: str,
+    run_index: int,
+    depth_row: np.ndarray,
+    segment: np.ndarray,
+    fs: int,
+    h5_path: str,
+    dive_id: str,
+
+    # Native FFT objects prepared once by CreateOutputCSVs_long
+    source_fft: np.ndarray | None = None,
+    fft_freqs_hz: np.ndarray | None = None,
+    n_time: int | None = None,
+
+    coherent: bool = False,
+    synthesis_fmin_hz: float = 1_000.0,
+    synthesis_fmax_hz: float = 24_000.0,
+    c_eff_m_s: float = 1480.0,
+    f_ref_hz: float = 35_000.0,
+    arrivals_include_absorption: bool = True,
+
+    metric_names=("p2p",),
+
+    dbband10_window_samples: int | None = None,
+    dbband10_search_range_hz=(1_000.0, 24_000.0),
+    dbband10_db_drop=10.0,
+    dbband10_use_hann=True,
+    dbband10_smoothing_bins=5,
+    click_samples=512,
+    pre_peak_fraction=0.25,
+    max_arrival_delay_s=None,
+):
     """
-    Worker: compute p2p outputs for one run across all depth indices present in depth_row.
-    If coherent=False → legacy single-IR method.
-    If coherent=True  → wideband coherent synthesis using reference arrivals + α(f).
+    Compute requested receiver metrics for one horizontal run.
+
+    When coherent=True, received waveforms are synthesized on the same native
+    rFFT grid used by the toy workflow:
+
+        source FFT
+        × arrival-derived transfer function
+        → inverse rFFT
+        → peak-to-peak and bandwidth metrics
+
+    The source FFT grid is prepared once in CreateOutputCSVs_long and passed
+    into this worker.
     """
-    required = ("time_of_arrival", "arrival_amplitude", "tx_depth_ndx", "rx_depth_ndx", "rx_range_ndx")
+
+    required = (
+        "time_of_arrival",
+        "arrival_amplitude",
+        "tx_depth_ndx",
+        "rx_depth_ndx",
+        "rx_range_ndx",
+    )
+
     results = []
 
+    # Make configuration errors fail immediately rather than producing
+    # misleading output.
+    if coherent:
+        if source_fft is None:
+            raise ValueError(
+                "source_fft must be supplied when coherent=True."
+            )
+
+        if fft_freqs_hz is None:
+            raise ValueError(
+                "fft_freqs_hz must be supplied when coherent=True."
+            )
+
+        if n_time is None:
+            raise ValueError(
+                "n_time must be supplied when coherent=True."
+            )
+
+        source_fft = np.asarray(
+            source_fft,
+            dtype=np.complex128,
+        ).reshape(-1)
+
+        fft_freqs_hz = np.asarray(
+            fft_freqs_hz,
+            dtype=float,
+        ).reshape(-1)
+
+        n_time = int(n_time)
+
+        if source_fft.size != fft_freqs_hz.size:
+            raise ValueError(
+                "source_fft and fft_freqs_hz must have equal lengths."
+            )
+
+        expected_fft_length = n_time // 2 + 1
+
+        if source_fft.size != expected_fft_length:
+            raise ValueError(
+                "source_fft length is inconsistent with n_time: "
+                f"expected {expected_fft_length}, got "
+                f"{source_fft.size}."
+            )
+
     with h5py.File(h5_path, "r") as hf:
-        path = f"drift_01/{dive_id}/frequency_{int(round(f_ref_hz))}/arrivals/{run_id}" \
-               if f"frequency_{int(round(f_ref_hz))}" in hf[f"drift_01/{dive_id}"] \
-               else f"drift_01/{dive_id}/frequency_35000/arrivals/{run_id}"
+
+        dive_path = f"drift_01/{dive_id}"
+        dive_root = hf[dive_path]
+        
+        frequency_key = _select_frequency_key(
+            dive_root,
+            target_hz=f_ref_hz,
+        )
+        
+        actual_f_ref_hz = float(
+            frequency_key.replace("frequency_", "")
+        )
+        
+        path = (
+            f"{dive_path}/{frequency_key}/arrivals/{run_id}"
+        )
+
+        path = (
+            f"{dive_path}/{frequency_key}/arrivals/{run_id}"
+        )
+
         arr0 = hf[path]
         data = {}
+
         for name in required:
-            if name in arr0:
-                arr = arr0[name][()]
-                try:
-                    arr = arr.data if hasattr(arr, "data") and getattr(arr, "mask", None) is not None else arr
-                except Exception:
-                    pass
-                data[name] = arr.ravel() if np.ndim(arr) > 1 else arr
-
-        # Optional, if you later add this dataset:
-        if "path_length_m" in arr0:
-            data["path_length_m"] = arr0["path_length_m"][()]
-
-        if len(data.get("rx_depth_ndx", [])) == 0:
-            return run_index, []
-
-        # # Pre-build frequency grid if needed
-        # if coherent:
-        #     fmax_hz = min(fmax_hz, 0.49 * fs)  # Nyquist safety
-        #     freqs = _build_freq_grid(fmin_hz=fmin_hz, fmax_hz=fmax_hz, df_hz=df_hz)
-            
-        if coherent:
-            fmax_hz = min(fmax_hz, 0.49 * fs)
-            freqs = _build_freq_grid(fmin_hz=fmin_hz, fmax_hz=fmax_hz, df_hz=df_hz)
-        
-            # PRECOMPUTE SOURCE ON GRID ONCE PER RUN
-            tau_all = np.asarray(data["time_of_arrival"], float).ravel()
-            S_f, n_time = _precompute_source_on_grid(segment, fs, freqs, tau_all)
-
-
-        # Evaluate only for valid depth indices in this row
-        depth_idxs = np.where(depth_row > 0)[0]
-        for d_idx in depth_idxs:
-            mask = data["rx_depth_ndx"] == d_idx
-            if not np.any(mask):
-                results.append((d_idx, {m: np.nan for m in metric_names}))
+            if name not in arr0:
                 continue
 
-            hyd = {k: (v[mask] if k in data else None) for k, v in data.items()}
+            arr = arr0[name][()]
 
-            # if coherent:
-            #     val_db, _ = p2pArrivalSNR_coherent(
-            #         hyd, segment, fs,
-            #         freqs_hz=freqs,
-            #         alpha_model="thorp",
-            #         c_eff_m_s=c_eff_m_s,
-            #         f_ref_hz=f_ref_hz,
-            #         arrivals_include_absorption=arrivals_include_absorption
-            #     )
-            # else:
-            #     val_db, _ = p2pArrivalSNR(hyd, segment, fs)
-            
-            if coherent:
-                received = coherent_received_waveform_fast(
-                    hyd, S_f=S_f, fs=fs, freqs_hz=freqs, n_time=n_time,
-                    c_eff_m_s=c_eff_m_s, f_ref_hz=f_ref_hz,
-                    arrivals_include_absorption=arrivals_include_absorption
+            try:
+                if (
+                    hasattr(arr, "data")
+                    and getattr(arr, "mask", None) is not None
+                ):
+                    arr = arr.data
+            except Exception:
+                pass
+
+            arr = np.asarray(arr)
+
+            if arr.ndim > 1:
+                arr = arr.ravel()
+
+            data[name] = arr
+
+        if "path_length_m" in arr0:
+            path_length = np.asarray(
+                arr0["path_length_m"][()]
+            )
+
+            if path_length.ndim > 1:
+                path_length = path_length.ravel()
+
+            data["path_length_m"] = path_length
+
+    if len(data.get("rx_depth_ndx", [])) == 0:
+        return run_index, []
+
+    # All arrival-indexed arrays should have the same length.
+    n_arrivals = len(data["rx_depth_ndx"])
+
+    for name, values in data.items():
+        if values is None:
+            continue
+
+        if len(values) != n_arrivals:
+            raise ValueError(
+                f"Arrival dataset '{name}' has length "
+                f"{len(values)}, but rx_depth_ndx has length "
+                f"{n_arrivals}. Path: {path}"
+            )
+
+    depth_idxs = np.where(depth_row > 0)[0]
+
+    for d_idx in depth_idxs:
+
+        mask = (
+            np.asarray(data["rx_depth_ndx"]).reshape(-1)
+            == d_idx
+        )
+
+        if not np.any(mask):
+            results.append(
+                (
+                    d_idx,
+                    {
+                        metric_name: np.nan
+                        for metric_name in metric_names
+                    },
                 )
-                metric_vals = _compute_metric_values(received, fs, metric_names)
-            else:
-                p2p_db, received = p2pArrivalSNR(hyd, segment, fs)
-                metric_vals = _compute_metric_values(received, fs, metric_names, precomputed_p2p_db=p2p_db)
-                    
-            
-            results.append((d_idx, metric_vals))
+            )
+            continue
+
+        hyd = {
+            name: np.asarray(values)[mask]
+            for name, values in data.items()
+        }
+
+        hyd = _apply_arrival_delay_filter(
+            hyd,
+            max_arrival_delay_s=max_arrival_delay_s,
+        )
+
+        arrival_times = np.asarray(
+            hyd.get("time_of_arrival", []),
+            dtype=float,
+        ).reshape(-1)
+
+        arrival_amplitudes = np.asarray(
+            hyd.get("arrival_amplitude", []),
+            dtype=complex,
+        ).reshape(-1)
+
+        if (
+            arrival_times.size == 0
+            or arrival_amplitudes.size == 0
+        ):
+            results.append(
+                (
+                    d_idx,
+                    {
+                        metric_name: np.nan
+                        for metric_name in metric_names
+                    },
+                )
+            )
+            continue
+
+        if coherent:
+            received, _, _ = synthesize_received_waveform(
+                arrivals=hyd,
+                source_fft=source_fft,
+                fft_freqs_hz=fft_freqs_hz,
+                fs=fs,
+                n_time=n_time,
+                f_ref_hz=actual_f_ref_hz,
+                synthesis_fmin_hz=synthesis_fmin_hz,
+                synthesis_fmax_hz=synthesis_fmax_hz,
+                c_eff_m_s=c_eff_m_s,
+            )
+
+            metric_vals = _compute_metric_values(
+                received_signal=received,
+                fs=fs,
+                metric_names=metric_names,
+                dbband10_window_samples=(
+                    dbband10_window_samples
+                ),
+                dbband10_search_range_hz=(
+                    dbband10_search_range_hz
+                ),
+                dbband10_db_drop=dbband10_db_drop,
+                dbband10_use_hann=dbband10_use_hann,
+                dbband10_smoothing_bins=(
+                    dbband10_smoothing_bins
+                ),
+                click_samples=click_samples,
+                pre_peak_fraction=pre_peak_fraction,
+            )
+
+        else:
+            p2p_db, received = p2pArrivalSNR(
+                hyd,
+                segment,
+                fs,
+            )
+
+            metric_vals = _compute_metric_values(
+                received_signal=received,
+                fs=fs,
+                metric_names=metric_names,
+                precomputed_p2p_db=p2p_db,
+                dbband10_window_samples=(
+                    dbband10_window_samples
+                ),
+                dbband10_search_range_hz=(
+                    dbband10_search_range_hz
+                ),
+                dbband10_db_drop=dbband10_db_drop,
+                dbband10_use_hann=dbband10_use_hann,
+                dbband10_smoothing_bins=(
+                    dbband10_smoothing_bins
+                ),
+                click_samples=click_samples,
+                pre_peak_fraction=pre_peak_fraction,
+            )
+
+        results.append(
+            (
+                d_idx,
+                metric_vals,
+            )
+        )
 
     return run_index, results
 
@@ -682,7 +1591,14 @@ def CreateOutputCSVs(h5_path: str,
                     process_run, run_id, run_index, depth_row,
                     segment, samplerate, h5_path, dive_id,
                     coherent, fmin_hz, fmax_hz, df_hz, c_eff_m_s,
-                    f_ref_hz, arrivals_include_absorption, ("p2p",)
+                    f_ref_hz, arrivals_include_absorption, ("p2p",),
+                    None,
+                    (1_000.0, 24_000.0),
+                    10.0,
+                    True,
+                    1,
+                    512,
+                    0.25,
                 ))
 
             for fut in tqdm(futures, desc=f"Dive {dive_id}"):
@@ -703,20 +1619,105 @@ def _ensure_parent_dir(path: str ) -> str:
     p.parent.mkdir(parents=True, exist_ok=True)
     return str(p)
 
-def CreateOutputCSVs_long(h5_path: str,
-                     segment: np.ndarray,
-                     samplerate: int,
-                     out_path: str,
-                     nWorkers: int = 10,
-                     prefer_processes: bool = False,
-                     coherent: bool = False,
-                     metrics="p2p",
-                     fmin_hz: float = 20000.0,
-                     fmax_hz: float = 90000.0,
-                     df_hz: float = 200.0,
-                     c_eff_m_s: float = 1480.0,
-                     f_ref_hz: float = 35000.0,
-                     arrivals_include_absorption: bool = True):
+
+
+
+def prepare_source_fft(
+    source_click,
+    fs,
+    max_delay_s=0.01,
+    guard_time_s=0.005,
+):
+    """Prepare the source click on one native rFFT frequency grid.
+
+    The FFT record is long enough to contain the source click, the retained
+    relative multipath delay spread, and guard intervals on both sides. The
+    click is placed after the first guard interval to prevent band-limited
+    pre-ringing from wrapping around to the end of the inverse FFT record.
+    """
+    source_click = np.asarray(source_click, dtype=float).reshape(-1)
+    source_click = np.nan_to_num(source_click)
+
+    if source_click.size == 0:
+        raise ValueError("The source click waveform is empty.")
+    if fs <= 0:
+        raise ValueError("Sampling rate must be positive.")
+
+    guard_samples = int(np.ceil(float(guard_time_s) * fs))
+    delay_samples = int(np.ceil(float(max_delay_s) * fs))
+
+    required_samples = (
+        guard_samples
+        + source_click.size
+        + delay_samples
+        + guard_samples
+    )
+    n_time = 1 << int(np.ceil(np.log2(max(required_samples, 2))))
+
+    padded_source = np.zeros(n_time, dtype=float)
+    click_start_sample = guard_samples
+    click_stop_sample = click_start_sample + source_click.size
+    padded_source[click_start_sample:click_stop_sample] = source_click
+
+    source_fft = np.fft.rfft(padded_source, n=n_time)
+    fft_freqs_hz = np.fft.rfftfreq(n_time, d=1.0 / fs)
+
+    return source_fft, fft_freqs_hz, n_time, click_start_sample
+
+
+def load_click_waveform(wav_path, target_fs_hz):
+    """Load the source click, mix to mono, and resample to the target rate."""
+    fs, audio = wavfile.read(wav_path)
+    audio = np.asarray(audio)
+
+    if np.issubdtype(audio.dtype, np.integer):
+        scale = max(abs(np.iinfo(audio.dtype).min), np.iinfo(audio.dtype).max)
+        audio = audio.astype(np.float64) / float(scale)
+    else:
+        audio = audio.astype(np.float64)
+
+    if audio.ndim > 1:
+        audio = np.mean(audio, axis=1)
+
+    if fs != target_fs_hz:
+        gcd = int(np.gcd(int(fs), int(target_fs_hz)))
+        up = int(target_fs_hz // gcd)
+        down = int(fs // gcd)
+        audio = resample_poly(audio, up, down)
+        fs = target_fs_hz
+
+    return audio, int(fs)
+
+def CreateOutputCSVs_long(
+    h5_path: str,
+    segment: np.ndarray,
+    samplerate: int,
+    out_path: str,
+    nWorkers: int = 10,
+    prefer_processes: bool = True,
+    coherent: bool = False,
+    metrics="p2p",
+    dbband10_use_direct_arrival_window: bool = False,
+    dbband10_window_scale: float = 3.0,
+    dbband10_energy_fraction: float = 0.90,
+    dbband10_search_range_hz=(1_000.0, 24_000.0),
+    dbband10_db_drop: float = 10.0,
+    dbband10_use_hann: bool = True,
+    dbband10_smoothing_bins: int = 5,
+    debug_report: bool = False,
+    debug_rows: int = 15,
+
+    # Native-FFT coherent synthesis band
+    synthesis_fmin_hz: float = 1_000.0,
+    synthesis_fmax_hz: float = 24_000.0,
+
+    c_eff_m_s: float = 1480.0,
+    f_ref_hz: float = 35_000.0,
+    arrivals_include_absorption: bool = True,
+    click_samples: int = 512,
+    pre_peak_fraction: float = 0.25,
+    max_arrival_delay_s: float | None = 0.01,
+    guard_time_s: float = 0.005,):
     """
         Build per-dive metric CSVs in parallel over RUNS.
 
@@ -728,24 +1729,80 @@ def CreateOutputCSVs_long(h5_path: str,
         ----------
         metrics : str | list[str]
                 One metric (e.g., "p2p") or a list (e.g., ["p2p", "dBBand10"]).
+        dbband10_use_direct_arrival_window : bool
+            If True, compute dBBand10 on a leading direct-arrival gate instead of the full waveform.
+        dbband10_window_scale : float
+            Direct-arrival gate length multiplier applied to the source 90% energy width.
+        dbband10_energy_fraction : float
+            Energy fraction used to define the source click width for the gate.
+        debug_report : bool
+            If True, print a compact table of range and computed metric values.
+        debug_rows : int
+            Number of rows to print in debug mode (sorted by range).
     """
     if mp.current_process().name != "MainProcess":
         return
 
     os.makedirs(out_path, exist_ok=True)
+    segment = _coerce_waveform_to_1d(segment)
+    
+
+    source_fft, fft_freqs_hz, n_time, click_start_sample = prepare_source_fft(
+        source_click=segment,
+        fs=samplerate,
+        max_delay_s=max_arrival_delay_s,
+        guard_time_s=guard_time_s,
+    )    
+    
     dive_ids = _enumerate_dives(h5_path)
-        metric_names = _normalize_metric_names(metrics)
-        source_dbband10_hz = _ten_db_bandwidth_hz(segment, samplerate)
-        primary_metric = metric_names[0]
+    metric_names = _normalize_metric_names(metrics)
+    
+    source_bandwidth_result = compute_pamguard_bandwidth_metrics(
+    waveform=segment,
+    sampling_rate_hz=samplerate,
+    click_samples=click_samples,
+    pre_peak_fraction=pre_peak_fraction,
+    search_range_hz=dbband10_search_range_hz,
+    db_drop=dbband10_db_drop,
+    use_hann=dbband10_use_hann,
+    smoothing_bins=dbband10_smoothing_bins,
+    include_spectrum=False)
+
+    source_dbband10_hz = source_bandwidth_result["bandwidth_hz"]
+    
+    
+    
+    primary_metric = metric_names[0]
+    dbband10_window_samples = None
+    if dbband10_use_direct_arrival_window and "dBBand10" in metric_names:
+        dbband10_window_samples = _scaled_energy_window_samples(
+            segment,
+            energy_fraction=dbband10_energy_fraction,
+            scale=dbband10_window_scale,
+        )
 
     for dive_id in dive_ids:
         print(f"Processing dive: {dive_id}")
 
         with h5py.File(h5_path, "r") as hf:
-            grp_key = f"drift_01/{dive_id}/frequency_{int(round(f_ref_hz))}"
-            if grp_key not in hf:
-                grp_key = f"drift_01/{dive_id}/frequency_35000"
+            dive_root = hf[f"drift_01/{dive_id}"]
+
+            frequency_key = _select_frequency_key(
+                dive_root,
+                target_hz=f_ref_hz,
+            )
+            
+            grp_key = f"drift_01/{dive_id}/{frequency_key}"
             dive_grp = hf[grp_key]
+            
+            actual_f_ref_hz = float(
+                frequency_key.replace("frequency_", "")
+            )
+            
+            print(
+                f"Using {frequency_key} for {dive_id} "
+                f"(requested f_ref_hz={f_ref_hz:g} Hz)"
+            )
 
             run_ids       = list(dive_grp["arrivals"].keys())
             depth_grid    = np.array(dive_grp["depth"])               # (nloc, ndep)
@@ -757,14 +1814,52 @@ def CreateOutputCSVs_long(h5_path: str,
             drifter_lat = float(dive_grp.parent.attrs["start_lat"])
             drifter_lon = float(dive_grp.parent.attrs["start_lon"])
 
+            # # Optional quick-test subset: sample 50 random run locations with a fixed seed.
+            # # Set this to False to process all locations.
+            # TEST_RUN_SUBSET_ENABLED = True
+            # TEST_RUN_SUBSET_SIZE = 50
+            # if TEST_RUN_SUBSET_ENABLED and len(run_ids) > TEST_RUN_SUBSET_SIZE:
+            #     rng = np.random.default_rng(0)
+            #     sampled_indices = np.sort(rng.choice(len(run_ids), size=TEST_RUN_SUBSET_SIZE, replace=False))
+            #     run_ids = [run_ids[idx] for idx in sampled_indices]
+            #     depth_grid = depth_grid[sampled_indices, :]
+            #     lat = lat[sampled_indices]
+            #     lon = lon[sampled_indices]
+            #     print(f"[TEST] CreateOutputCSVs_long using {len(run_ids)} sampled run_ids for quick testing.")
+
         metric_grids = {
             m: np.full_like(depth_grid, np.nan, dtype=np.float64)
             for m in metric_names
         }
+        
+        for metric_name, metric_grid in metric_grids.items():
+            finite_count = int(np.isfinite(metric_grid).sum())
+        
+            print(
+                f"[Metric check] {dive_id}: "
+                f"{metric_name} has {finite_count:,} finite values"
+            )
 
         Executor, _mode = _choose_executor(prefer_processes)
-        if coherent:
-            fmax_hz = min(fmax_hz, 0.49 * samplerate)
+        nyquist_hz = samplerate / 2.0
+
+        if synthesis_fmin_hz < 0:
+            raise ValueError(
+                "synthesis_fmin_hz cannot be negative."
+            )
+        
+        if synthesis_fmax_hz > nyquist_hz:
+            raise ValueError(
+                "synthesis_fmax_hz exceeds the Nyquist frequency: "
+                f"{synthesis_fmax_hz:g} Hz requested, "
+                f"but Nyquist is {nyquist_hz:g} Hz."
+            )
+        
+        if synthesis_fmax_hz <= synthesis_fmin_hz:
+            raise ValueError(
+                "synthesis_fmax_hz must be greater than "
+                "synthesis_fmin_hz."
+            )
 
         # ---- Compute RL grid (unchanged) ----
         with Executor(max_workers=nWorkers) as pool:
@@ -772,10 +1867,46 @@ def CreateOutputCSVs_long(h5_path: str,
             for run_index, run_id in enumerate(run_ids):
                 depth_row = depth_grid[run_index, :]
                 futures.append(pool.submit(
-                    process_run, run_id, run_index, depth_row,
-                    segment, samplerate, h5_path, dive_id,
-                    coherent, fmin_hz, fmax_hz, df_hz, c_eff_m_s,
-                    f_ref_hz, arrivals_include_absorption, tuple(metric_names)
+                    process_run,
+
+                   run_id=run_id,
+                   run_index=run_index,
+                   depth_row=depth_row,
+                   segment=segment,
+                   fs=samplerate,
+                   h5_path=h5_path,
+                   dive_id=dive_id,
+            
+                   source_fft=source_fft,
+                   fft_freqs_hz=fft_freqs_hz,
+                   n_time=n_time,
+            
+                   coherent=coherent,
+                   synthesis_fmin_hz=synthesis_fmin_hz,
+                   synthesis_fmax_hz=synthesis_fmax_hz,
+                   c_eff_m_s=c_eff_m_s,
+                   f_ref_hz=f_ref_hz,
+                   arrivals_include_absorption=(
+                       arrivals_include_absorption
+                   ),
+            
+                   metric_names=tuple(metric_names),
+            
+                   dbband10_window_samples=(
+                       dbband10_window_samples
+                   ),
+                   dbband10_search_range_hz=(
+                       dbband10_search_range_hz
+                   ),
+                   dbband10_db_drop=dbband10_db_drop,
+                   dbband10_use_hann=dbband10_use_hann,
+                   dbband10_smoothing_bins=(
+                       dbband10_smoothing_bins
+                   ),
+                   click_samples=click_samples,
+                   pre_peak_fraction=pre_peak_fraction,
+                   max_arrival_delay_s=max_arrival_delay_s,
+               
                 ))
 
             for fut in tqdm(futures, desc=f"Dive {dive_id}"):
@@ -825,26 +1956,54 @@ def CreateOutputCSVs_long(h5_path: str,
         # Keep only cells with a valid RL AND valid depth value
         valid = np.isfinite(RL_flat) & np.isfinite(depth_flat)
         out_data = {
-            "lat":         lat_flat[valid],
-            "lon":         lon_flat[valid],
-            "drifterlat":  np.full(valid.sum(), drifter_lat, dtype=float),
-            "drifterlon":  np.full(valid.sum(), drifter_lon, dtype=float),
-            "range":       range_flat[valid],
-            "depth_m":     depth_flat[valid],
-            "RL":          RL_flat[valid],
-            "source_dBBand10": np.full(valid.sum(), source_dbband10_hz, dtype=float),
+            "lat": lat_flat[valid],
+            "lon": lon_flat[valid],
+            "drifterlat": np.full(valid.sum(), drifter_lat, dtype=float),
+            "drifterlon": np.full(valid.sum(), drifter_lon, dtype=float),
+            "range": range_flat[valid],
+            "depth_m": depth_flat[valid],
+            "RL": RL_flat[valid],
+            "source_dBBand10": np.full(
+                valid.sum(),
+                source_dbband10_hz,
+                dtype=float,
+            ),
         }
+        
+        # Add the received metrics, including dBBand10
         for metric_name in metric_names:
             out_data[metric_name] = metric_flat[metric_name][valid]
+        
+        df_out = pd.DataFrame(out_data)
+        
+        print(
+            f"[Export check] {dive_id}: columns = "
+            f"{list(df_out.columns)}"
+        )
         df_out = pd.DataFrame(out_data)
 
+        if debug_report:
+            debug_cols = ["range"] + metric_names
+            # Keep columns unique and present.
+            debug_cols = [c for i, c in enumerate(debug_cols) if c in df_out.columns and c not in debug_cols[:i]]
+            if dbband10_window_samples is not None:
+                print(
+                    f"[Debug] {dive_id}: dBBand10 direct-arrival window = {dbband10_window_samples} samples "
+                    f"({dbband10_window_samples / float(samplerate):.6f} s)"
+                )
+            if len(debug_cols) > 1:
+                n_show = max(1, int(debug_rows))
+                dbg = df_out[debug_cols].dropna().sort_values("range").head(n_show)
+                print(f"[Debug] {dive_id}: range and metrics (first {len(dbg)} rows)")
+                print(dbg.to_string(index=False))
+            else:
+                print(f"[Debug] {dive_id}: no metric columns available to report")
+
         if metric_names == ["p2p"]:
-            long_name = (f"PeakToPeak_{dive_id}_GliderDepth_{int(round(drifter_depth))}m_"
-                         f"{int(fmin_hz/1000)}_{int(fmax_hz/1000)}khz_long.csv")
+            long_name = (f"PeakToPeak_{dive_id}_GliderDepth_{int(round(drifter_depth))}m_khz_long.csv")
         else:
             metric_tag = "_".join(metric_names)
-            long_name = (f"Metrics_{metric_tag}_{dive_id}_GliderDepth_{int(round(drifter_depth))}m_"
-                         f"{int(fmin_hz/1000)}_{int(fmax_hz/1000)}khz_long.csv")
+            long_name = (f"Metrics_{metric_tag}_{dive_id}_GliderDepth_{int(round(drifter_depth))}m_khz_long.csv")
         long_file = os.path.join(out_path, long_name)
         df_out.to_csv(_ensure_parent_dir(long_file), index=False)
         print(f"Saved long CSV: {long_file}  ({len(df_out):,} rows)")
@@ -862,6 +2021,7 @@ def coherent_received_waveform_fast(arrivals: dict,
     amp = np.asarray(arrivals.get("arrival_amplitude", []), complex).reshape(-1)
     if tau.size == 0 or amp.size == 0:
         return np.zeros(n_time, dtype=float)
+    tau_rel = tau - np.min(tau)
 
     # Path length estimate (since you do not store path_length_m)
     Rm = tau * float(c_eff_m_s)
@@ -884,7 +2044,7 @@ def coherent_received_waveform_fast(arrivals: dict,
     w = np.exp(-Rm[:, None] * delta_np_per_m[None, :]) * amp[:, None]   # complex (M,K)
 
     # phase term exp(-j2π f τ_i) shape (M,K)
-    phase = np.exp(-1j * 2.0*np.pi * tau[:, None] * freqs_hz[None, :])
+    phase = np.exp(-1j * 2.0*np.pi * tau_rel[:, None] * freqs_hz[None, :])
 
     H_f = np.sum(w * phase, axis=0)   # shape (K,)
 
@@ -1550,77 +2710,54 @@ def CreateOutputCSVs_long_worker(
     segment,
     samplerate,
     out_path,
+    nWorkers=10,
+    prefer_processes=False,
+    coherent=False,
+    metrics="p2p",
+    dbband10_use_direct_arrival_window=False,
+    dbband10_window_scale=3.0,
+    dbband10_energy_fraction=0.90,
+    dbband10_search_range_hz=(1_000.0, 24_000.0),
+    dbband10_db_drop=10.0,
+    dbband10_use_hann=True,
+    dbband10_smoothing_bins=5,
+    click_samples=512,
+    pre_peak_fraction=0.25,
+    fmin_hz=20000.0,
+    fmax_hz=90000.0,
+    df_hz=200.0,
+    c_eff_m_s=1480.0,
+    arrivals_include_absorption=True,
     f_ref_hz=12000,
+    max_arrival_delay_s=0.01,
 ):
-    import h5py
-    import numpy as np
-    import pandas as pd
-    import os
+    return CreateOutputCSVs_long(
+        h5_path=h5_path,
+        segment=segment,
+        samplerate=samplerate,
+        out_path=out_path,
+        nWorkers=nWorkers,
+        prefer_processes=prefer_processes,
+        coherent=coherent,
+        metrics=metrics,
+        dbband10_use_direct_arrival_window=dbband10_use_direct_arrival_window,
+        dbband10_window_scale=dbband10_window_scale,
+        dbband10_energy_fraction=dbband10_energy_fraction,
+        dbband10_search_range_hz=dbband10_search_range_hz,
+        dbband10_db_drop=dbband10_db_drop,
+        dbband10_use_hann=dbband10_use_hann,
+        dbband10_smoothing_bins=dbband10_smoothing_bins,
+        click_samples=click_samples,
+        pre_peak_fraction=pre_peak_fraction,
+        fmin_hz=fmin_hz,
+        fmax_hz=fmax_hz,
+        df_hz=df_hz,
+        c_eff_m_s=c_eff_m_s,
+        f_ref_hz=f_ref_hz,
+        arrivals_include_absorption=arrivals_include_absorption,
+        max_arrival_delay_s=max_arrival_delay_s,
+    )
 
-    os.makedirs(out_path, exist_ok=True)
-
-    with h5py.File(h5_path, "r") as h5:
-
-        drift_id = list(h5.keys())[0]
-
-        for dive_id in h5[drift_id].keys():
-
-            print(f"Processing {dive_id} in {os.path.basename(h5_path)}")
-
-            grp = h5[drift_id][dive_id][f"frequency_{int(f_ref_hz)}"]
-
-            arrivals_grp = grp["arrivals"]
-            run_ids = list(arrivals_grp.keys())
-
-            lat = np.asarray(grp["lat"]).ravel()
-            lon = np.asarray(grp["lon"]).ravel()
-            depth_grid = np.asarray(grp["depth"])
-
-            rows = []
-
-            for run_idx, run_id in enumerate(run_ids):
-
-                depth_row = depth_grid[run_idx]
-
-                for pt in arrivals_grp[run_id].keys():
-
-                    try:
-                        toa = np.array(arrivals_grp[run_id][pt]["time_of_arrival"])
-                        amp = np.array(arrivals_grp[run_id][pt]["arrival_amplitude"])
-                    except:
-                        continue
-
-                    if toa.size == 0 or amp.size == 0:
-                        continue
-
-                    # simple RL proxy (replace later if needed)
-                    RL = np.abs(amp).max()
-
-                    for d in depth_row:
-                        if not np.isfinite(d) or d == -500:
-                            continue
-
-                        rows.append([
-                            lat[run_idx],
-                            lon[run_idx],
-                            d,
-                            RL
-                        ])
-
-            if len(rows) == 0:
-                print(f"⚠️ No valid data in {dive_id}")
-                continue
-
-            df = pd.DataFrame(rows, columns=["lat", "lon", "depth_m", "RL"])
-
-            out_file = os.path.join(
-                out_path,
-                f"{os.path.basename(h5_path).replace('.h5','')}_{dive_id}.csv"
-            )
-
-            df.to_csv(out_file, index=False)
-
-            print(f"Saved: {out_file} ({len(df)} rows)")
 
 # ============================================================================
 # Plotting long version
