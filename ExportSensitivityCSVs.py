@@ -9,18 +9,33 @@ should be the begining of a package
 """
 import sys
 sys.path.append(r"C:\Users\pam_user\Documents\GitHub\SPACIOUS-Propagation")
-from scipy.io import wavfile
 import os
 #from PlottingDefs import CreateOutputCSVs, CreateOutputCSVs_Spherical, export_long_tables_spherical
-from PlottingDefs import scaleP2P # for source level scaling
+from PlottingDefs import scaleP2P, load_click_waveform  # for source level scaling
 from PlottingDefs import plot_peak2peak_isosurfaces, plot_detection_probability
 from PlottingDefs import plot_detection_vs_range, fig_signal_ir_output, fit_and_plot_hazard_rate_by_location
-from PlottingDefs import CreateOutputCSVs_long
-import librosa
+from PlottingDefs import CreateOutputCSVs_long, compute_pamguard_bandwidth_metrics
 import numpy as np
 import matplotlib.pyplot as plt
 
 
+
+import inspect
+import PlottingDefs
+
+print("\nMODULE DIAGNOSTIC")
+print("PlottingDefs path:")
+print(PlottingDefs.__file__)
+
+print("\nBandwidth function signature:")
+print(inspect.signature(
+    PlottingDefs.compute_pamguard_bandwidth_metrics
+))
+
+print("\nBandwidth function source starts:")
+print(inspect.getsource(
+    PlottingDefs.compute_pamguard_bandwidth_metrics
+))
 
 
 #%% Create the CSV's of the arrival RLs
@@ -30,58 +45,50 @@ h5_path = 'X:\Kaitlin_Palmer\\CalCurCEAS_propagation_hdf5s\\BottomSenExperiment\
 wav_path = "C:\\Users\\pam_user\\Documents\\GitHub\\SPACIOUS-Propagation-Modes\\ExampleData\\WHICEAS_click.wav"
 out_path = "X:\Kaitlin_Palmer\CalCurCEAS_propagation_csvs\BottomSenExperiment"
 
+
+wav_path = (
+    r"C:\Users\pam_user\Documents\GitHub\SPACIOUS-Propagation-Modes"
+    r"\ExampleData\WHICEAS_click.wav"
+)
+
 # h5_path = 'C:\\Users\\kaity\\Documents\\GitHub\\SPACIOUS-Propagation-Modes\\Spacious_Hawaii_diveDepth_ArrArray_PCHIP_35khz_20km - Copy.h5'
 # wav_path = "C:\\Users\\kaity\\Documents\\GitHub\\SPACIOUS-Propagation-Modes\\ExampleData\\LF_1705_20171028_010934_441.wav"
 # out_path = "C:\\Users\\kaity\\Desktop\\TestCoherentBellhopCSVS"
 
-# --- Signal Setup ---
-#samplerate, audiodata = wavfile.read(wav_path)
-audiodata, samplerate = librosa.load(wav_path, sr=60000,    mono= False)
-#t_start, t_end, chan = 32.58, 32.60, 4
-#segment = audiodata[chan, int(round(t_start * samplerate)):int(round(t_end * samplerate))]
-tt = np.linspace(0, len(audiodata)/samplerate, len(audiodata))
-# Adjust figure size and DPI if needed
-plt.figure(figsize=(11, 5), dpi=100)
 
-# Plot raw click for a giggle test
-plt.figure(1)
-plt.plot(tt*1000, audiodata)
-plt.xlabel('Time (ms)', fontsize=12)
-plt.ylabel('Amplitude', fontsize=12)
-plt.title('Raw Sperm Whale Click', fontsize=14)
-
+samplerate = 500000
 # Scale the segment using the custom function so it's 220 dB 
 # peak-to-peak prior to convolution with the impulse response
-click_waveform = scaleP2P(audiodata, outP2P= 220)
+# --- Signal Setup ---
+#audiodata, samplerate = load_click_waveform(wav_path, target_fs_hz=500_000)
 
-plt.plot(tt*1000, click_waveform)
+source_click, source_fs = load_click_waveform(wav_path, samplerate)
+click_waveform = scaleP2P(source_click, outP2P=220)
 
+result = compute_pamguard_bandwidth_metrics(click_waveform, source_fs)
+
+
+#%% Temp
 
 #%% Use convolution of the signal of interest to calculate the peak to peak
 # RL at each of the sensor locations
 
 # Calculate the received arrays and export to csv- this takes a while
-
-import os
-import glob
-import os
 from pathlib import Path
-
-os.chdir('X:\\Kaitlin_Palmer\\\CalCurCEAS_propagation_hdf5s\\')
-result = glob.glob('*.{}'.format('h5'))
-print(result)
 
 base_in  = Path(r"X:\Kaitlin_Palmer\CalCurCEAS_propagation_hdf5s")
 base_out = Path(r"X:\Kaitlin_Palmer\BotSensitivityCSVs")
-
-
+result = sorted(base_in.glob('*.h5'))
+print([h5file.name for h5file in result])
 
 for h5file in result:
+    
+    
     # Full path to input HDF5
-    hfLoc = base_in / h5file
+    hfLoc = h5file
 
     # Decide subfolder based on filename (case-insensitive)
-    name_lower = h5file.lower()
+    name_lower = h5file.name.lower()
     if "gravel" in name_lower:
         subdir = "gravel"
     elif "silt" in name_lower:
@@ -94,23 +101,34 @@ for h5file in result:
     out_path.mkdir(parents=True, exist_ok=True)
 
     # Optional: construct an explicit CSV filename (not used by CreateOutputCSVs_long)
-    fname = Path(h5file).stem + "On_axis"
+    fname = h5file.stem + "On_axis"
     out_csv = out_path / f"{fname}.csv"
 
     # Run export
     CreateOutputCSVs_long(
-        h5_path=str(hfLoc),
-        segment=click_waveform,         # 1-D np.ndarray
-        samplerate=samplerate,
-        out_path=str(out_path),
+        h5_path=str(h5file),
+        segment=click_waveform,
+        samplerate=source_fs,
+        out_path=str(base_out),
+        metrics=["p2p", "dBBand10"],
+    
         coherent=True,
-        nWorkers=15,
-        f_ref_hz=12000,
-        prefer_processes=False,         # threads are safer on Windows top-level
-        fmin_hz=100, 
-        fmax_hz=samplerate/2, 
-        df_hz=100
-    )
+    
+        f_ref_hz=12_000.0,
+    
+        synthesis_fmin_hz=1_000.0,
+        synthesis_fmax_hz=24_000.0,
+    
+        dbband10_use_direct_arrival_window=False,
+        dbband10_search_range_hz=(1_000.0, 24_000.0),
+        dbband10_db_drop=10.0,
+        dbband10_use_hann=True,
+        dbband10_smoothing_bins=5,
+        click_samples=512,
+        pre_peak_fraction=0.25,
+    
+        max_arrival_delay_s=0.01,
+        guard_time_s=0.005,)
 
     print(f"{h5file} -> {out_path}")
 
